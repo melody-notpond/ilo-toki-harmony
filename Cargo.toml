@@ -1,0 +1,14 @@
+[package]
+name = "ilo-toki"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+crossterm = "0.20"
+dotenv = "0.15.0"
+harmony_rust_sdk = { version = "0.7.0", features = ["client_native"] }
+tokio = { version = "1.15.0", features = ["full"] }
+tui = { version = "0.16", default-features = false, features = ['crossterm'] }
+ueberzug = "0.1.0"
