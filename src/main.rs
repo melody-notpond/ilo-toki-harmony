@@ -1,4 +1,5 @@
 use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::collections::VecDeque;
 
 use crossterm::event::KeyCode;
 use harmony_rust_sdk::{
@@ -33,9 +34,12 @@ impl Default for AppMode {
 struct AppState {
     mode: AppMode,
 
-    // TODO: replace with something that doesn't take O(n) to insert a character
     input: String,
+    input_byte_pos: usize,
+    input_char_pos: usize,
     command: String,
+    command_byte_pos: usize,
+    command_char_pos: usize,
 }
 
 #[tokio::main]
@@ -43,7 +47,7 @@ async fn main() -> ClientResult<()> {
     let state = Arc::new(RwLock::new(AppState::default()));
 
     let tui_handler = tokio::spawn(tui(state.clone()));
-    let events = tokio::spawn(ui_events(state));
+    let events_handler = tokio::spawn(ui_events(state));
 
     /*
     // Get auth data from .env file
@@ -76,7 +80,6 @@ async fn main() -> ClientResult<()> {
     tokio::spawn(receive_events(client.clone(), events));
     */
 
-    println!("nya");
     while RUNNING.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_micros(200)).await;
     }
@@ -86,9 +89,9 @@ async fn main() -> ClientResult<()> {
     client
         .call(UpdateProfile::default().with_new_status(UserStatus::OfflineUnspecified))
         .await.unwrap();
-        */
+    */
 
-    events.abort();
+    events_handler.abort();
     tui_handler.await.unwrap().unwrap();
     std::process::exit(0);
 }
@@ -169,13 +172,30 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 match state.mode {
                     AppMode::TextNormal => widgets::Paragraph::new("normal"),
                     AppMode::TextInsert => widgets::Paragraph::new("insert"),
-                    AppMode::Command => widgets::Paragraph::new(Spans::from(vec![
-                        Span::raw(":"),
-                        Span::raw(&state.command),
-                    ])),
+
+                    AppMode::Command => {
+                        widgets::Paragraph::new(Spans::from(vec![
+                            Span::raw(":"),
+                            Span::raw(state.command.as_str()),
+                        ]))
+                    }
                 }
             };
             f.render_widget(status, content[2]);
+
+            match state.mode {
+                AppMode::TextNormal => {
+                    f.set_cursor(content[1].x + state.input_char_pos as u16 + 1, content[1].y + 1);
+                }
+
+                AppMode::TextInsert => {
+                    f.set_cursor(content[1].x + state.input_char_pos as u16 + 1, content[1].y + 1);
+                }
+
+                AppMode::Command => {
+                    f.set_cursor(content[2].x + state.command_char_pos as u16 + 1, content[2].y + 1);
+                }
+            }
         })?;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -200,10 +220,39 @@ async fn ui_events(state: Arc<RwLock<AppState>>) {
                                 state.write().await.mode = AppMode::TextInsert;
                             }
 
+                            // TODO: up/down
+                            KeyCode::Char('h') | KeyCode::Left => {
+                                let mut state = state.write().await;
+
+                                if state.input_byte_pos > 0 {
+                                    let mut i = 1;
+                                    while !state.input.is_char_boundary(state.input_byte_pos - i) {
+                                        i += 1;
+                                    }
+                                    state.input_byte_pos -= i;
+                                    state.input_char_pos -= 1;
+                                }
+                            }
+
+                            KeyCode::Char('l') | KeyCode::Right => {
+                                let mut state = state.write().await;
+
+                                if state.input_byte_pos < state.input.bytes().len() {
+                                    let mut i = 1;
+                                    while !state.input.is_char_boundary(state.input_byte_pos + i) {
+                                        i += 1;
+                                    }
+                                    state.input_byte_pos += i;
+                                    state.input_char_pos += 1;
+                                }
+                            }
+
                             KeyCode::Char(':') => {
                                 let mut state = state.write().await;
                                 state.mode = AppMode::Command;
                                 state.command.clear();
+                                state.command_byte_pos = 0;
+                                state.command_char_pos = 0;
                             }
 
                             _ => (),
@@ -216,8 +265,54 @@ async fn ui_events(state: Arc<RwLock<AppState>>) {
                                 state.write().await.mode = AppMode::TextNormal;
                             }
 
+                            // TODO: up/down
+                            KeyCode::Left => {
+                                let mut state = state.write().await;
+
+                                if state.input_byte_pos > 0 {
+                                    let mut i = 1;
+                                    while !state.input.is_char_boundary(state.input_byte_pos - i) {
+                                        i += 1;
+                                    }
+                                    state.input_byte_pos -= i;
+                                    state.input_char_pos -= 1;
+                                }
+                            }
+
+                            KeyCode::Right => {
+                                let mut state = state.write().await;
+
+                                if state.input_byte_pos < state.input.bytes().len() {
+                                    let mut i = 1;
+                                    while !state.input.is_char_boundary(state.input_byte_pos + i) {
+                                        i += 1;
+                                    }
+                                    state.input_byte_pos += i;
+                                    state.input_char_pos += 1;
+                                }
+                            }
+
+                            KeyCode::Backspace => {
+                                let mut state = state.write().await;
+
+                                if state.input_byte_pos > 0 {
+                                    let mut i = 1;
+                                    while !state.input.is_char_boundary(state.input_byte_pos - i) {
+                                        i += 1;
+                                    }
+                                    state.input_byte_pos -= i;
+                                    state.input_char_pos -= 1;
+                                    let pos = state.input_byte_pos;
+                                    state.input.remove(pos);
+                                }
+                            }
+
                             KeyCode::Char(c) => {
-                                state.write().await.input.push(c);
+                                let mut state = state.write().await;
+                                let pos = state.input_byte_pos;
+                                state.input.insert(pos, c);
+                                state.input_byte_pos += c.len_utf8();
+                                state.input_char_pos += 1;
                             }
 
                             _ => (),
@@ -238,8 +333,56 @@ async fn ui_events(state: Arc<RwLock<AppState>>) {
                                 }
                             }
 
+                            // TODO: up/down to scroll through history
+                            KeyCode::Left => {
+                                let mut state = state.write().await;
+
+                                if state.command_byte_pos > 0 {
+                                    let mut i = 1;
+                                    while !state.command.is_char_boundary(state.command_byte_pos - i) {
+                                        i += 1;
+                                    }
+                                    state.command_byte_pos -= i;
+                                    state.command_char_pos -= 1;
+                                }
+                            }
+
+                            KeyCode::Right => {
+                                let mut state = state.write().await;
+
+                                if state.command_byte_pos < state.command.bytes().len() {
+                                    let mut i = 1;
+                                    while !state.command.is_char_boundary(state.command_byte_pos + i) {
+                                        i += 1;
+                                    }
+                                    state.command_byte_pos += i;
+                                    state.command_char_pos += 1;
+                                }
+                            }
+
+                            KeyCode::Backspace => {
+                                let mut state = state.write().await;
+
+                                if state.command_byte_pos > 0 {
+                                    let mut i = 1;
+                                    while !state.command.is_char_boundary(state.command_byte_pos - i) {
+                                        i += 1;
+                                    }
+                                    state.command_byte_pos -= i;
+                                    state.command_char_pos -= 1;
+                                    let pos = state.command_byte_pos;
+                                    state.command.remove(pos);
+                                } else if state.command.is_empty() {
+                                    state.mode = AppMode::TextNormal;
+                                }
+                            }
+
                             KeyCode::Char(c) => {
-                                state.write().await.command.push(c);
+                                let mut state = state.write().await;
+                                let pos = state.command_byte_pos;
+                                state.command.insert(pos, c);
+                                state.command_byte_pos += c.len_utf8();
+                                state.command_char_pos += 1;
                             }
 
                             _ => (),
