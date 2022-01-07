@@ -1,20 +1,46 @@
-use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}, collections::HashMap, time::UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    env,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::UNIX_EPOCH,
+};
 
 use chrono::{DateTime, Local};
 use crossterm::{event::KeyCode, execute};
 
 use harmony_rust_sdk::{
-    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText, self, GetGuildMembersRequest, GetMessageRequest, Message as RawMessage, get_channel_messages_request::Direction}, auth::Session, profile::GetProfileRequest},
+    api::{
+        auth::Session,
+        chat::{
+            self,
+            content::{Content, TextContent},
+            get_channel_messages_request::Direction,
+            EventSource, FormattedText, GetGuildListRequest, GetGuildMembersRequest,
+            GetMessageRequest, Message as RawMessage, SendMessageRequest,
+        },
+        profile::GetProfileRequest,
+    },
     client::{
-        api::{profile::{UpdateProfile, UserStatus}, chat::channel::GetChannelMessages},
+        api::{
+            chat::channel::GetChannelMessages,
+            profile::{UpdateProfile, UserStatus},
+        },
         error::ClientResult,
         Client,
     },
 };
 
-use tokio::sync::{RwLock, mpsc, RwLockWriteGuard};
+use tokio::sync::{mpsc, RwLock, RwLockWriteGuard};
 use tokio::time::Duration;
-use tui::{backend::CrosstermBackend, Terminal, widgets, layout, text::{Spans, Span, Text}};
+use tui::{
+    backend::CrosstermBackend,
+    layout,
+    text::{Span, Spans, Text},
+    widgets, Terminal,
+};
 
 /// Determines whether the program is currently running or not
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -137,7 +163,9 @@ async fn main() -> ClientResult<()> {
     tokio::spawn(ui_events(state.clone(), tx));
 
     // Create client
-    let client = Client::new(homeserver, Some(Session::new(user_id, session_id))).await.unwrap();
+    let client = Client::new(homeserver, Some(Session::new(user_id, session_id)))
+        .await
+        .unwrap();
 
     // Change our status to online
     client
@@ -146,8 +174,12 @@ async fn main() -> ClientResult<()> {
                 .with_new_status(UserStatus::Online)
                 .with_new_is_bot(false),
         )
-        .await.unwrap();
-    let members = client.call(GetGuildMembersRequest::new(guild_id)).await.unwrap();
+        .await
+        .unwrap();
+    let members = client
+        .call(GetGuildMembersRequest::new(guild_id))
+        .await
+        .unwrap();
 
     {
         // Get members of the guild
@@ -155,18 +187,26 @@ async fn main() -> ClientResult<()> {
         for member in members.members {
             let profile = client.call(GetProfileRequest::new(member)).await.unwrap();
             if let Some(profile) = profile.profile {
-                state.users.insert(member, Member {
-                    id: member,
-                    name: profile.user_name,
-                    is_bot: profile.is_bot,
-                });
+                state.users.insert(
+                    member,
+                    Member {
+                        id: member,
+                        name: profile.user_name,
+                        is_bot: profile.is_bot,
+                    },
+                );
             }
         }
     }
 
-    let messages = client.call(GetChannelMessages::new(guild_id, channel_id)
-                               .with_direction(Some(Direction::BeforeUnspecified))
-                               .with_count(50)).await.unwrap();
+    let messages = client
+        .call(
+            GetChannelMessages::new(guild_id, channel_id)
+                .with_direction(Some(Direction::BeforeUnspecified))
+                .with_count(50),
+        )
+        .await
+        .unwrap();
     {
         let mut state = state.write().await;
         for message in messages.messages.into_iter().rev() {
@@ -174,7 +214,6 @@ async fn main() -> ClientResult<()> {
                 handle_message(&mut state, message).await;
             }
         }
-
     }
 
     // Our account's user id
@@ -182,7 +221,11 @@ async fn main() -> ClientResult<()> {
 
     // Event filters
     //let guilds = client.call(GetGuildListRequest::default()).await.unwrap();
-    let events = vec![EventSource::Homeserver, EventSource::Action, EventSource::Guild(guild_id)];
+    let events = vec![
+        EventSource::Homeserver,
+        EventSource::Action,
+        EventSource::Guild(guild_id),
+    ];
     //events.extend(guilds.guilds.iter().map(|v| EventSource::Guild(v.guild_id)));
 
     // Spawn event loop
@@ -195,7 +238,20 @@ async fn main() -> ClientResult<()> {
             // Send messages
             ClientEvent::Send(msg) => {
                 let state = state.read().await;
-                client.call(SendMessageRequest::new(state.current_guild, state.current_channel, Some(chat::Content::new(Some(Content::new_text_message(TextContent::new(Some(FormattedText::new(msg, vec![]))))))), None, None, None, None)).await.unwrap();
+                client
+                    .call(SendMessageRequest::new(
+                        state.current_guild,
+                        state.current_channel,
+                        Some(chat::Content::new(Some(Content::new_text_message(
+                            TextContent::new(Some(FormattedText::new(msg, vec![]))),
+                        )))),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .await
+                    .unwrap();
             }
 
             // Quit
@@ -206,7 +262,8 @@ async fn main() -> ClientResult<()> {
     // Change our account's status back to offline
     client
         .call(UpdateProfile::default().with_new_status(UserStatus::OfflineUnspecified))
-        .await.unwrap();
+        .await
+        .unwrap();
 
     // Die! :D
     std::process::exit(0);
@@ -241,78 +298,87 @@ async fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: Raw
 }
 
 /// Event loop to process incoming events.
-async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, events: Vec<EventSource>) {
-    client.event_loop(events, {
-        move |_client, event| {
-            // This has to be done for ownership reasons
-            let state2 = state.clone();
+async fn receive_events(
+    state: Arc<RwLock<AppState>>,
+    client: Arc<Client>,
+    events: Vec<EventSource>,
+) {
+    client
+        .event_loop(events, {
+            move |_client, event| {
+                // This has to be done for ownership reasons
+                let state2 = state.clone();
 
-            async move {
-                // Stop if not running
-                if !RUNNING.load(Ordering::Acquire) {
-                    Ok(true)
-                } else {
-                    match event {
-                        // Chat events
-                        chat::Event::Chat(event) => {
-                            match event {
-                                chat::stream_event::Event::GuildAddedToList(_) => {}
-                                chat::stream_event::Event::GuildRemovedFromList(_) => {}
-                                chat::stream_event::Event::ActionPerformed(_) => {}
+                async move {
+                    // Stop if not running
+                    if !RUNNING.load(Ordering::Acquire) {
+                        Ok(true)
+                    } else {
+                        match event {
+                            // Chat events
+                            chat::Event::Chat(event) => {
+                                match event {
+                                    chat::stream_event::Event::GuildAddedToList(_) => {}
+                                    chat::stream_event::Event::GuildRemovedFromList(_) => {}
+                                    chat::stream_event::Event::ActionPerformed(_) => {}
 
-                                // Received a message
-                                chat::stream_event::Event::SentMessage(message) => {
-                                    // Get state
-                                    let mut state = state2.write().await;
+                                    // Received a message
+                                    chat::stream_event::Event::SentMessage(message) => {
+                                        // Get state
+                                        let mut state = state2.write().await;
 
-                                    // TEMP: check if message belongs to current channel before adding
-                                    if message.guild_id == state.current_guild && message.channel_id == state.current_channel {
-                                        // Get message
-                                        if let Some(message) = message.message {
-                                            handle_message(&mut state, message).await;
+                                        // TEMP: check if message belongs to current channel before adding
+                                        if message.guild_id == state.current_guild
+                                            && message.channel_id == state.current_channel
+                                        {
+                                            // Get message
+                                            if let Some(message) = message.message {
+                                                handle_message(&mut state, message).await;
+                                            }
                                         }
                                     }
+
+                                    // TODO
+                                    chat::stream_event::Event::EditedMessage(_) => {}
+                                    chat::stream_event::Event::DeletedMessage(_) => {}
+                                    chat::stream_event::Event::CreatedChannel(_) => {}
+                                    chat::stream_event::Event::EditedChannel(_) => {}
+                                    chat::stream_event::Event::DeletedChannel(_) => {}
+                                    chat::stream_event::Event::EditedGuild(_) => {}
+                                    chat::stream_event::Event::DeletedGuild(_) => {}
+                                    chat::stream_event::Event::JoinedMember(_) => {}
+                                    chat::stream_event::Event::LeftMember(_) => {}
+                                    chat::stream_event::Event::Typing(_) => {}
+                                    chat::stream_event::Event::RoleCreated(_) => {}
+                                    chat::stream_event::Event::RoleDeleted(_) => {}
+                                    chat::stream_event::Event::RoleMoved(_) => {}
+                                    chat::stream_event::Event::RoleUpdated(_) => {}
+                                    chat::stream_event::Event::RolePermsUpdated(_) => {}
+                                    chat::stream_event::Event::UserRolesUpdated(_) => {}
+                                    chat::stream_event::Event::PermissionUpdated(_) => {}
+                                    chat::stream_event::Event::ChannelsReordered(_) => {}
+                                    chat::stream_event::Event::EditedChannelPosition(_) => {}
+                                    chat::stream_event::Event::MessagePinned(_) => {}
+                                    chat::stream_event::Event::MessageUnpinned(_) => {}
+                                    chat::stream_event::Event::ReactionUpdated(_) => {}
+                                    chat::stream_event::Event::OwnerAdded(_) => {}
+                                    chat::stream_event::Event::OwnerRemoved(_) => {}
+                                    chat::stream_event::Event::InviteReceived(_) => {}
+                                    chat::stream_event::Event::InviteRejected(_) => {}
                                 }
-
-                                // TODO
-                                chat::stream_event::Event::EditedMessage(_) => {}
-                                chat::stream_event::Event::DeletedMessage(_) => {}
-                                chat::stream_event::Event::CreatedChannel(_) => {}
-                                chat::stream_event::Event::EditedChannel(_) => {}
-                                chat::stream_event::Event::DeletedChannel(_) => {}
-                                chat::stream_event::Event::EditedGuild(_) => {}
-                                chat::stream_event::Event::DeletedGuild(_) => {}
-                                chat::stream_event::Event::JoinedMember(_) => {}
-                                chat::stream_event::Event::LeftMember(_) => {}
-                                chat::stream_event::Event::Typing(_) => {}
-                                chat::stream_event::Event::RoleCreated(_) => {}
-                                chat::stream_event::Event::RoleDeleted(_) => {}
-                                chat::stream_event::Event::RoleMoved(_) => {}
-                                chat::stream_event::Event::RoleUpdated(_) => {}
-                                chat::stream_event::Event::RolePermsUpdated(_) => {}
-                                chat::stream_event::Event::UserRolesUpdated(_) => {}
-                                chat::stream_event::Event::PermissionUpdated(_) => {}
-                                chat::stream_event::Event::ChannelsReordered(_) => {}
-                                chat::stream_event::Event::EditedChannelPosition(_) => {}
-                                chat::stream_event::Event::MessagePinned(_) => {}
-                                chat::stream_event::Event::MessageUnpinned(_) => {}
-                                chat::stream_event::Event::ReactionUpdated(_) => {}
-                                chat::stream_event::Event::OwnerAdded(_) => {}
-                                chat::stream_event::Event::OwnerRemoved(_) => {}
-                                chat::stream_event::Event::InviteReceived(_) => {}
-                                chat::stream_event::Event::InviteRejected(_) => {}
                             }
-                        }
 
-                        // TODO
-                        chat::Event::Profile(_) => {}
-                        chat::Event::Emote(_) => {}
+                            // TODO
+                            chat::Event::Profile(_) => {}
+                            chat::Event::Emote(_) => {}
+                        }
+                        Ok(false)
                     }
-                    Ok(false)
                 }
             }
-        }
-    }).await.unwrap();
+        })
+        .await
+        .unwrap();
 }
 
 /// Handles rendering the terminal UI.
@@ -337,7 +403,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 .constraints([
                     layout::Constraint::Length(20),
                     layout::Constraint::Percentage(90),
-                ]).split(size);
+                ])
+                .split(size);
 
             let sidebar = layout::Layout::default()
                 .direction(layout::Direction::Vertical)
@@ -374,52 +441,59 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 .split(horizontal[1]);
 
             // Guild list
-            let servers = widgets::Block::default()
-                .borders(widgets::Borders::ALL);
+            let servers = widgets::Block::default().borders(widgets::Borders::ALL);
             f.render_widget(servers, sidebar[0]);
 
             // Channel list
-            let channels = widgets::Block::default()
-                .borders(widgets::Borders::ALL);
+            let channels = widgets::Block::default().borders(widgets::Borders::ALL);
             f.render_widget(channels, sidebar[1]);
 
             // Messages
-            let messages = widgets::Block::default()
-                .borders(widgets::Borders::ALL);
+            let messages = widgets::Block::default().borders(widgets::Borders::ALL);
 
             // Format current list of messages
-            let messages_list: Vec<_> = state.messages.iter().rev().map(|v| {
-                widgets::ListItem::new(Text::from({
-                    let inner = messages.inner(content[0]);
-                    let mut result = vec![Spans::from("")];
+            let messages_list: Vec<_> = state
+                .messages
+                .iter()
+                .rev()
+                .map(|v| {
+                    widgets::ListItem::new(Text::from({
+                        let inner = messages.inner(content[0]);
+                        let mut result = vec![Spans::from("")];
 
-                    // Metadata
-                    let (author, is_bot) = state.users.get(&v.author_id).map(|v| (v.name.as_str(), v.is_bot)).unwrap_or(("<unknown user>", true));
-                    let mut metadata = vec![Span::raw(author)];
-                    if is_bot {
-                        metadata.push(Span::raw(" [BOT]"));
-                    }
-                    let time: DateTime<Local> = DateTime::from(UNIX_EPOCH + Duration::from_secs(v.timestamp));
-                    let format = time.format(" - %H:%M (%x)").to_string();
-                    metadata.push(Span::raw(format));
-                    result.push(Spans::from(metadata));
-
-                    // Content
-                    match &v.content {
-                        // Text wraps
-                        MessageContent::Text(text) => {
-                            let mut i = 0;
-                            while i + (inner.width as usize) < text.len() {
-                                result.push(Spans::from(&text[i..i + inner.width as usize]));
-                                i += inner.width as usize;
-                            }
-                            result.push(Spans::from(&text[i..]));
+                        // Metadata
+                        let (author, is_bot) = state
+                            .users
+                            .get(&v.author_id)
+                            .map(|v| (v.name.as_str(), v.is_bot))
+                            .unwrap_or(("<unknown user>", true));
+                        let mut metadata = vec![Span::raw(author)];
+                        if is_bot {
+                            metadata.push(Span::raw(" [BOT]"));
                         }
-                    }
+                        let time: DateTime<Local> =
+                            DateTime::from(UNIX_EPOCH + Duration::from_secs(v.timestamp));
+                        let format = time.format(" - %H:%M (%x)").to_string();
+                        metadata.push(Span::raw(format));
+                        result.push(Spans::from(metadata));
 
-                    result
-                }))
-            }).collect();
+                        // Content
+                        match &v.content {
+                            // Text wraps
+                            MessageContent::Text(text) => {
+                                let mut i = 0;
+                                while i + (inner.width as usize) < text.len() {
+                                    result.push(Spans::from(&text[i..i + inner.width as usize]));
+                                    i += inner.width as usize;
+                                }
+                                result.push(Spans::from(&text[i..]));
+                            }
+                        }
+
+                        result
+                    }))
+                })
+                .collect();
 
             // Render messages
             let messages = widgets::List::new(messages_list)
@@ -428,11 +502,9 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             f.render_widget(messages, content[0]);
 
             // Input
-            let input = widgets::Block::default()
-                .borders(widgets::Borders::ALL);
+            let input = widgets::Block::default().borders(widgets::Borders::ALL);
 
-            let input = widgets::Paragraph::new(input_text)
-                .block(input);
+            let input = widgets::Paragraph::new(input_text).block(input);
             f.render_widget(input, content[1]);
 
             // Status bar (mode and who is typing)
@@ -441,12 +513,10 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     AppMode::TextNormal => widgets::Paragraph::new("normal"),
                     AppMode::TextInsert => widgets::Paragraph::new("insert"),
 
-                    AppMode::Command => {
-                        widgets::Paragraph::new(Spans::from(vec![
-                            Span::raw(":"),
-                            Span::raw(state.command.as_str()),
-                        ]))
-                    }
+                    AppMode::Command => widgets::Paragraph::new(Spans::from(vec![
+                        Span::raw(":"),
+                        Span::raw(state.command.as_str()),
+                    ])),
                 }
             };
             f.render_widget(status, content[2]);
@@ -459,9 +529,17 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     execute!(stdout, SetCursorShape(CursorShape::Block)).unwrap();
                     let m = state.input_char_pos as u16 % (content[1].width - 2);
                     if m == 0 && state.input_char_pos != 0 {
-                        f.set_cursor(content[1].x + content[1].width - 1, content[1].y + (state.input_char_pos as u16 - 1) / (content[1].width - 2) + 1);
+                        f.set_cursor(
+                            content[1].x + content[1].width - 1,
+                            content[1].y
+                                + (state.input_char_pos as u16 - 1) / (content[1].width - 2)
+                                + 1,
+                        );
                     } else {
-                        f.set_cursor(content[1].x + m + 1, content[1].y + state.input_char_pos as u16 / (content[1].width - 2) + 1);
+                        f.set_cursor(
+                            content[1].x + m + 1,
+                            content[1].y + state.input_char_pos as u16 / (content[1].width - 2) + 1,
+                        );
                     }
                 }
 
@@ -471,9 +549,17 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     execute!(stdout, SetCursorShape(CursorShape::Line)).unwrap();
                     let m = state.input_char_pos as u16 % (content[1].width - 2);
                     if m == 0 && state.input_char_pos != 0 {
-                        f.set_cursor(content[1].x + content[1].width - 1, content[1].y + (state.input_char_pos as u16 - 1) / (content[1].width - 2) + 1);
+                        f.set_cursor(
+                            content[1].x + content[1].width - 1,
+                            content[1].y
+                                + (state.input_char_pos as u16 - 1) / (content[1].width - 2)
+                                + 1,
+                        );
                     } else {
-                        f.set_cursor(content[1].x + m + 1, content[1].y + state.input_char_pos as u16 / (content[1].width - 2) + 1);
+                        f.set_cursor(
+                            content[1].x + m + 1,
+                            content[1].y + state.input_char_pos as u16 / (content[1].width - 2) + 1,
+                        );
                     }
                 }
 
@@ -481,7 +567,10 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 AppMode::Command => {
                     use crossterm::cursor::{CursorShape, SetCursorShape};
                     execute!(stdout, SetCursorShape(CursorShape::Line)).unwrap();
-                    f.set_cursor(content[2].x + state.command_char_pos as u16 + 1, content[2].y + 1);
+                    f.set_cursor(
+                        content[2].x + state.command_char_pos as u16 + 1,
+                        content[2].y + 1,
+                    );
                 }
             }
         })?;
@@ -679,7 +768,10 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                                 if state.command_byte_pos > 0 {
                                     let mut i = 1;
-                                    while !state.command.is_char_boundary(state.command_byte_pos - i) {
+                                    while !state
+                                        .command
+                                        .is_char_boundary(state.command_byte_pos - i)
+                                    {
                                         i += 1;
                                     }
                                     state.command_byte_pos -= i;
@@ -693,7 +785,10 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                                 if state.command_byte_pos < state.command.bytes().len() {
                                     let mut i = 1;
-                                    while !state.command.is_char_boundary(state.command_byte_pos + i) {
+                                    while !state
+                                        .command
+                                        .is_char_boundary(state.command_byte_pos + i)
+                                    {
                                         i += 1;
                                     }
                                     state.command_byte_pos += i;
@@ -707,7 +802,10 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                                 if state.command_byte_pos > 0 {
                                     let mut i = 1;
-                                    while !state.command.is_char_boundary(state.command_byte_pos - i) {
+                                    while !state
+                                        .command
+                                        .is_char_boundary(state.command_byte_pos - i)
+                                    {
                                         i += 1;
                                     }
                                     state.command_byte_pos -= i;
