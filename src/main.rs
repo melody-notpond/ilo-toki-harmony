@@ -1,6 +1,6 @@
 use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
-use crossterm::event::KeyCode;
+use crossterm::{event::KeyCode, execute};
 use harmony_rust_sdk::{
     api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText, self}, auth::Session},
     client::{
@@ -12,7 +12,7 @@ use harmony_rust_sdk::{
 
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::Duration;
-use tui::{backend::CrosstermBackend, Terminal, widgets, layout, text::{Spans, Span}};
+use tui::{backend::CrosstermBackend, Terminal, widgets, layout, text::{Spans, Span, Text}};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -212,6 +212,7 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
 async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
     let stdout = std::io::stdout();
     let backend = CrosstermBackend::new(stdout);
+    let mut stdout = std::io::stdout();
     let mut terminal = Terminal::new(backend)?;
     crossterm::terminal::enable_raw_mode()?;
     terminal.clear()?;
@@ -221,7 +222,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
         terminal.draw(|f| {
             let size = f.size();
 
-            // Create horizontal split
+            // Create layout
             let horizontal = layout::Layout::default()
                 .direction(layout::Direction::Horizontal)
                 .constraints([
@@ -237,11 +238,26 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 ])
                 .split(horizontal[0]);
 
+            let input_text = {
+                Text::from({
+                    let width = horizontal[1].width as usize - 2;
+                    let mut result = vec![];
+                    let mut i = 0;
+                    while i + width < state.input.len() {
+                        result.push(Spans::from(&state.input[i..i + width]));
+                        i += width;
+                    }
+                    result.push(Spans::from(&state.input[i..]));
+
+                    result
+                })
+            };
+
             let content = layout::Layout::default()
                 .direction(layout::Direction::Vertical)
                 .constraints([
                     layout::Constraint::Min(3),
-                    layout::Constraint::Length(3),
+                    layout::Constraint::Length(input_text.height() as u16 + 2),
                     layout::Constraint::Length(1),
                 ])
                 .split(horizontal[1]);
@@ -254,19 +270,27 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 .borders(widgets::Borders::ALL);
             f.render_widget(channels, sidebar[1]);
 
-            // TODO: make a custom widget for this so we don't allocate a new Vec every frame
-            let messages_list: Vec<_> = state.messages.iter().map(|v| {
-                widgets::ListItem::new(Spans::from(vec![Span::raw(v.author.as_str()), Span::raw(" "), {
-                    match &v.content {
-                        MessageContent::Text(text) => {
-                            Span::raw(text.as_str())
-                        }
-                    }
-                }]))
-            }).collect();
-
             let messages = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
+
+            let messages_list: Vec<_> = state.messages.iter().map(|v| {
+                widgets::ListItem::new(Text::from({
+                    let inner = messages.inner(content[0]);
+                    let mut result = vec![Spans::from(Span::raw(v.author.as_str()))];
+                    match &v.content {
+                        MessageContent::Text(text) => {
+                            let mut i = 0;
+                            while i + (inner.width as usize) < text.len() {
+                                result.push(Spans::from(&text[i..i + inner.width as usize]));
+                                i += inner.width as usize;
+                            }
+                            result.push(Spans::from(&text[i..]));
+                        }
+                    }
+
+                    result
+                }))
+            }).collect();
 
             let messages = widgets::List::new(messages_list)
                 .block(messages);
@@ -275,7 +299,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             let input = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
 
-            let input = widgets::Paragraph::new(state.input.as_str())
+            let input = widgets::Paragraph::new(input_text)
                 .block(input);
             f.render_widget(input, content[1]);
 
@@ -296,14 +320,30 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
 
             match state.mode {
                 AppMode::TextNormal => {
-                    f.set_cursor(content[1].x + state.input_char_pos as u16 + 1, content[1].y + 1);
+                    use crossterm::cursor::{CursorShape, SetCursorShape};
+                    execute!(stdout, SetCursorShape(CursorShape::Block)).unwrap();
+                    let m = state.input_char_pos as u16 % (content[1].width - 2);
+                    if m == 0 && state.input_char_pos != 0 {
+                        f.set_cursor(content[1].x + content[1].width - 1, content[1].y + (state.input_char_pos as u16 - 1) / (content[1].width - 2) + 1);
+                    } else {
+                        f.set_cursor(content[1].x + m + 1, content[1].y + state.input_char_pos as u16 / (content[1].width - 2) + 1);
+                    }
                 }
 
                 AppMode::TextInsert => {
-                    f.set_cursor(content[1].x + state.input_char_pos as u16 + 1, content[1].y + 1);
+                    use crossterm::cursor::{CursorShape, SetCursorShape};
+                    execute!(stdout, SetCursorShape(CursorShape::Line)).unwrap();
+                    let m = state.input_char_pos as u16 % (content[1].width - 2);
+                    if m == 0 && state.input_char_pos != 0 {
+                        f.set_cursor(content[1].x + content[1].width - 1, content[1].y + (state.input_char_pos as u16 - 1) / (content[1].width - 2) + 1);
+                    } else {
+                        f.set_cursor(content[1].x + m + 1, content[1].y + state.input_char_pos as u16 / (content[1].width - 2) + 1);
+                    }
                 }
 
                 AppMode::Command => {
+                    use crossterm::cursor::{CursorShape, SetCursorShape};
+                    execute!(stdout, SetCursorShape(CursorShape::Line)).unwrap();
                     f.set_cursor(content[2].x + state.command_char_pos as u16 + 1, content[2].y + 1);
                 }
             }
