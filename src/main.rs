@@ -2,7 +2,7 @@ use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
 use crossterm::event::KeyCode;
 use harmony_rust_sdk::{
-    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText}, auth::Session},
+    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText, self}, auth::Session},
     client::{
         api::profile::{UpdateProfile, UserStatus},
         error::ClientResult,
@@ -30,13 +30,25 @@ enum AppMode{
 
 impl Default for AppMode {
     fn default() -> Self {
-        Self::TextNormal
+        Self::TextInsert
     }
+}
+
+enum MessageContent {
+    Text(String),
+}
+
+struct Message {
+    author_id: u64,
+    author: String,
+    content: MessageContent,
 }
 
 #[derive(Default)]
 struct AppState {
     mode: AppMode,
+
+    messages: Vec<Message>,
 
     current_channel: u64,
     current_guild: u64,
@@ -83,19 +95,19 @@ async fn main() -> ClientResult<()> {
     // Our account's user id
     //let self_id = client.auth_status().session().unwrap().user_id;
 
-    let guilds = client.call(GetGuildListRequest::default()).await.unwrap();
-    let mut events = vec![EventSource::Homeserver, EventSource::Action];
-    events.extend(guilds.guilds.iter().map(|v| EventSource::Guild(v.guild_id)));
+    //let guilds = client.call(GetGuildListRequest::default()).await.unwrap();
+    let events = vec![EventSource::Homeserver, EventSource::Action, EventSource::Guild(guild_id)];
+    //events.extend(guilds.guilds.iter().map(|v| EventSource::Guild(v.guild_id)));
 
     let client = Arc::new(client);
 
-    tokio::spawn(receive_events(client.clone(), events));
+    tokio::spawn(receive_events(state.clone(), client.clone(), events));
 
     while let Some(event) = rx.recv().await {
         match event {
             ClientEvent::Send(msg) => {
                 let state = state.read().await;
-                client.call(SendMessageRequest::new(state.current_guild, state.current_channel, Some(harmony_rust_sdk::api::chat::Content::new(Some(Content::new_text_message(TextContent::new(Some(FormattedText::new(msg, vec![]))))))), None, None, None, None)).await.unwrap();
+                client.call(SendMessageRequest::new(state.current_guild, state.current_channel, Some(chat::Content::new(Some(Content::new_text_message(TextContent::new(Some(FormattedText::new(msg, vec![]))))))), None, None, None, None)).await.unwrap();
             }
 
             ClientEvent::Quit => break,
@@ -110,19 +122,91 @@ async fn main() -> ClientResult<()> {
     std::process::exit(0);
 }
 
-async fn receive_events(client: Arc<Client>, events: Vec<EventSource>) {
-    client
-        .event_loop(events, {
-            move |_client, _event| {
-                async move {
-                    if !RUNNING.load(Ordering::Acquire) {
-                        Ok(true)
-                    } else {
-                        Ok(false)
+async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, events: Vec<EventSource>) {
+    client.event_loop(events, {
+        move |_client, event| {
+            let state2 = state.clone();
+            async move {
+                if !RUNNING.load(Ordering::Acquire) {
+                    Ok(true)
+                } else {
+                    match event {
+                        chat::Event::Chat(event) => {
+                            match event {
+                                chat::stream_event::Event::GuildAddedToList(_) => {}
+                                chat::stream_event::Event::GuildRemovedFromList(_) => {}
+                                chat::stream_event::Event::ActionPerformed(_) => {}
+
+                                chat::stream_event::Event::SentMessage(message) => {
+                                    let mut state = state2.write().await;
+                                    if message.guild_id == state.current_guild && message.channel_id == state.current_channel {
+                                        if let Some(message) = message.message {
+                                            if let Some(content) = message.content {
+                                                if let Some(content) = content.content {
+                                                    match content {
+                                                        Content::TextMessage(text) => {
+                                                            if let Some(text) = text.content {
+                                                                state.messages.push(Message {
+                                                                    author_id: message.author_id,
+                                                                    author: format!("id_{}", message.author_id),
+                                                                    content: MessageContent::Text(text.text),
+                                                                });
+                                                            }
+                                                        }
+
+                                                        Content::EmbedMessage(_) => {}
+                                                        Content::AttachmentMessage(_) => {}
+                                                        Content::PhotoMessage(_) => {}
+                                                        Content::InviteRejected(_) => {}
+                                                        Content::InviteAccepted(_) => {}
+                                                        Content::RoomUpgradedToGuild(_) => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                chat::stream_event::Event::EditedMessage(_) => {}
+                                chat::stream_event::Event::DeletedMessage(_) => {}
+                                chat::stream_event::Event::CreatedChannel(_) => {}
+                                chat::stream_event::Event::EditedChannel(_) => {}
+                                chat::stream_event::Event::DeletedChannel(_) => {}
+                                chat::stream_event::Event::EditedGuild(_) => {}
+                                chat::stream_event::Event::DeletedGuild(_) => {}
+                                chat::stream_event::Event::JoinedMember(_) => {}
+                                chat::stream_event::Event::LeftMember(_) => {}
+                                chat::stream_event::Event::Typing(_) => {}
+                                chat::stream_event::Event::RoleCreated(_) => {}
+                                chat::stream_event::Event::RoleDeleted(_) => {}
+                                chat::stream_event::Event::RoleMoved(_) => {}
+                                chat::stream_event::Event::RoleUpdated(_) => {}
+                                chat::stream_event::Event::RolePermsUpdated(_) => {}
+                                chat::stream_event::Event::UserRolesUpdated(_) => {}
+                                chat::stream_event::Event::PermissionUpdated(_) => {}
+                                chat::stream_event::Event::ChannelsReordered(_) => {}
+                                chat::stream_event::Event::EditedChannelPosition(_) => {}
+                                chat::stream_event::Event::MessagePinned(_) => {}
+                                chat::stream_event::Event::MessageUnpinned(_) => {}
+                                chat::stream_event::Event::ReactionUpdated(_) => {}
+                                chat::stream_event::Event::OwnerAdded(_) => {}
+                                chat::stream_event::Event::OwnerRemoved(_) => {}
+                                chat::stream_event::Event::InviteReceived(_) => {}
+                                chat::stream_event::Event::InviteRejected(_) => {}
+                            }
+                        }
+
+                        chat::Event::Profile(_) => {
+                        }
+
+                        chat::Event::Emote(_) => {
+                        }
                     }
+                    Ok(false)
                 }
             }
-        }).await.unwrap();
+        }
+    }).await.unwrap();
 }
 
 async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
@@ -170,8 +254,22 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 .borders(widgets::Borders::ALL);
             f.render_widget(channels, sidebar[1]);
 
+            // TODO: make a custom widget for this so we don't allocate a new Vec every frame
+            let messages_list: Vec<_> = state.messages.iter().map(|v| {
+                widgets::ListItem::new(Spans::from(vec![Span::raw(v.author.as_str()), Span::raw(" "), {
+                    match &v.content {
+                        MessageContent::Text(text) => {
+                            Span::raw(text.as_str())
+                        }
+                    }
+                }]))
+            }).collect();
+
             let messages = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
+
+            let messages = widgets::List::new(messages_list)
+                .block(messages);
             f.render_widget(messages, content[0]);
 
             let input = widgets::Block::default()
@@ -274,6 +372,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 std::mem::swap(&mut message, &mut state.input);
                                 state.input_byte_pos = 0;
                                 state.input_char_pos = 0;
+                                state.mode = AppMode::TextInsert;
 
                                 let _ = tx.send(ClientEvent::Send(message)).await;
                             }
@@ -336,6 +435,16 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 state.input.insert(pos, c);
                                 state.input_byte_pos += c.len_utf8();
                                 state.input_char_pos += 1;
+                            }
+
+                            KeyCode::Enter => {
+                                let mut state = state.write().await;
+                                let mut message = String::new();
+                                std::mem::swap(&mut message, &mut state.input);
+                                state.input_byte_pos = 0;
+                                state.input_char_pos = 0;
+
+                                let _ = tx.send(ClientEvent::Send(message)).await;
                             }
 
                             _ => (),
