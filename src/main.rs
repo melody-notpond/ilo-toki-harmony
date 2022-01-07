@@ -4,15 +4,15 @@ use chrono::{DateTime, Local};
 use crossterm::{event::KeyCode, execute};
 
 use harmony_rust_sdk::{
-    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText, self, GetGuildMembersRequest}, auth::Session, profile::GetProfileRequest},
+    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText, self, GetGuildMembersRequest, GetMessageRequest, Message as RawMessage, get_channel_messages_request::Direction}, auth::Session, profile::GetProfileRequest},
     client::{
-        api::profile::{UpdateProfile, UserStatus},
+        api::{profile::{UpdateProfile, UserStatus}, chat::channel::GetChannelMessages},
         error::ClientResult,
         Client,
     },
 };
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, RwLockWriteGuard};
 use tokio::time::Duration;
 use tui::{backend::CrosstermBackend, Terminal, widgets, layout, text::{Spans, Span, Text}};
 
@@ -30,7 +30,7 @@ enum ClientEvent {
 
 #[derive(Copy, Clone)]
 /// The current mode of the application.
-enum AppMode{
+enum AppMode {
     /// Normal mode for text.
     TextNormal,
 
@@ -164,6 +164,19 @@ async fn main() -> ClientResult<()> {
         }
     }
 
+    let messages = client.call(GetChannelMessages::new(guild_id, channel_id)
+                               .with_direction(Some(Direction::BeforeUnspecified))
+                               .with_count(50)).await.unwrap();
+    {
+        let mut state = state.write().await;
+        for message in messages.messages.into_iter().rev() {
+            if let Some(message) = message.message {
+                handle_message(&mut state, message).await;
+            }
+        }
+
+    }
+
     // Our account's user id
     //let self_id = client.auth_status().session().unwrap().user_id;
 
@@ -199,6 +212,34 @@ async fn main() -> ClientResult<()> {
     std::process::exit(0);
 }
 
+async fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessage) {
+    // Get content
+    if let Some(content) = message.content {
+        if let Some(content) = content.content {
+            match content {
+                // Text message
+                Content::TextMessage(text) => {
+                    if let Some(text) = text.content {
+                        state.messages.push(Message {
+                            author_id: message.author_id,
+                            content: MessageContent::Text(text.text),
+                            timestamp: message.created_at,
+                        });
+                    }
+                }
+
+                // TODO
+                Content::EmbedMessage(_) => {}
+                Content::AttachmentMessage(_) => {}
+                Content::PhotoMessage(_) => {}
+                Content::InviteRejected(_) => {}
+                Content::InviteAccepted(_) => {}
+                Content::RoomUpgradedToGuild(_) => {}
+            }
+        }
+    }
+}
+
 /// Event loop to process incoming events.
 async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, events: Vec<EventSource>) {
     client.event_loop(events, {
@@ -228,31 +269,7 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
                                     if message.guild_id == state.current_guild && message.channel_id == state.current_channel {
                                         // Get message
                                         if let Some(message) = message.message {
-                                            // Get content
-                                            if let Some(content) = message.content {
-                                                if let Some(content) = content.content {
-                                                    match content {
-                                                        // Text message
-                                                        Content::TextMessage(text) => {
-                                                            if let Some(text) = text.content {
-                                                                state.messages.push(Message {
-                                                                    author_id: message.author_id,
-                                                                    content: MessageContent::Text(text.text),
-                                                                    timestamp: message.created_at,
-                                                                });
-                                                            }
-                                                        }
-
-                                                        // TODO
-                                                        Content::EmbedMessage(_) => {}
-                                                        Content::AttachmentMessage(_) => {}
-                                                        Content::PhotoMessage(_) => {}
-                                                        Content::InviteRejected(_) => {}
-                                                        Content::InviteAccepted(_) => {}
-                                                        Content::RoomUpgradedToGuild(_) => {}
-                                                    }
-                                                }
-                                            }
+                                            handle_message(&mut state, message).await;
                                         }
                                     }
                                 }
