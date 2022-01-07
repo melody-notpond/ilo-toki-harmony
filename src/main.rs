@@ -1,8 +1,10 @@
-use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}, collections::HashMap, time::UNIX_EPOCH};
 
+use chrono::{DateTime, Local};
 use crossterm::{event::KeyCode, execute};
+
 use harmony_rust_sdk::{
-    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText, self}, auth::Session},
+    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText, self, GetGuildMembersRequest}, auth::Session, profile::GetProfileRequest},
     client::{
         api::profile::{UpdateProfile, UserStatus},
         error::ClientResult,
@@ -56,11 +58,23 @@ struct Message {
     /// The user id of the author.
     author_id: u64,
 
-    /// The username of the author of the message.
-    author: String,
-
     /// The content of the message.
     content: MessageContent,
+
+    /// The timestamp the message was created at.
+    timestamp: u64,
+}
+
+/// Represents a member of a guild.
+struct Member {
+    /// The id of the member
+    id: u64,
+
+    /// The name of the member
+    name: String,
+
+    /// Whether the member is a bot or not.
+    is_bot: bool,
 }
 
 #[derive(Default)]
@@ -71,6 +85,9 @@ struct AppState {
 
     /// TEMP: The list of messages in the current channel.
     messages: Vec<Message>,
+
+    /// The map of users.
+    users: HashMap<u64, Member>,
 
     /// The current channel being viewed.
     current_channel: u64,
@@ -130,6 +147,22 @@ async fn main() -> ClientResult<()> {
                 .with_new_is_bot(false),
         )
         .await.unwrap();
+    let members = client.call(GetGuildMembersRequest::new(guild_id)).await.unwrap();
+
+    {
+        // Get members of the guild
+        let mut state = state.write().await;
+        for member in members.members {
+            let profile = client.call(GetProfileRequest::new(member)).await.unwrap();
+            if let Some(profile) = profile.profile {
+                state.users.insert(member, Member {
+                    id: member,
+                    name: profile.user_name,
+                    is_bot: profile.is_bot,
+                });
+            }
+        }
+    }
 
     // Our account's user id
     //let self_id = client.auth_status().session().unwrap().user_id;
@@ -191,8 +224,7 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
                                     // Get state
                                     let mut state = state2.write().await;
 
-                                    // TEMP: check if message belongs to current channel before
-                                    // adding
+                                    // TEMP: check if message belongs to current channel before adding
                                     if message.guild_id == state.current_guild && message.channel_id == state.current_channel {
                                         // Get message
                                         if let Some(message) = message.message {
@@ -205,8 +237,8 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
                                                             if let Some(text) = text.content {
                                                                 state.messages.push(Message {
                                                                     author_id: message.author_id,
-                                                                    author: format!("id_{}", message.author_id),
                                                                     content: MessageContent::Text(text.text),
+                                                                    timestamp: message.created_at,
                                                                 });
                                                             }
                                                         }
@@ -342,9 +374,18 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             let messages_list: Vec<_> = state.messages.iter().rev().map(|v| {
                 widgets::ListItem::new(Text::from({
                     let inner = messages.inner(content[0]);
+                    let mut result = vec![Spans::from("")];
 
                     // Metadata
-                    let mut result = vec![Spans::from(""), Spans::from(Span::raw(v.author.as_str()))];
+                    let (author, is_bot) = state.users.get(&v.author_id).map(|v| (v.name.as_str(), v.is_bot)).unwrap_or(("<unknown user>", true));
+                    let mut metadata = vec![Span::raw(author)];
+                    if is_bot {
+                        metadata.push(Span::raw(" [BOT]"));
+                    }
+                    let time: DateTime<Local> = DateTime::from(UNIX_EPOCH + Duration::from_secs(v.timestamp));
+                    let format = time.format(" - %H:%M (%x)").to_string();
+                    metadata.push(Span::raw(format));
+                    result.push(Spans::from(metadata));
 
                     // Content
                     match &v.content {
