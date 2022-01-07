@@ -1,9 +1,8 @@
 use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}};
-use std::collections::VecDeque;
 
 use crossterm::event::KeyCode;
 use harmony_rust_sdk::{
-    api::{chat::{GetGuildListRequest, EventSource}, auth::Session},
+    api::{chat::{GetGuildListRequest, EventSource, SendMessageRequest, content::{Content, TextContent}, FormattedText}, auth::Session},
     client::{
         api::profile::{UpdateProfile, UserStatus},
         error::ClientResult,
@@ -11,11 +10,16 @@ use harmony_rust_sdk::{
     },
 };
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::Duration;
 use tui::{backend::CrosstermBackend, Terminal, widgets, layout, text::{Spans, Span}};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+
+enum ClientEvent {
+    Quit,
+    Send(String),
+}
 
 #[derive(Copy, Clone)]
 enum AppMode{
@@ -34,6 +38,9 @@ impl Default for AppMode {
 struct AppState {
     mode: AppMode,
 
+    current_channel: u64,
+    current_guild: u64,
+
     input: String,
     input_byte_pos: usize,
     input_char_pos: usize,
@@ -44,17 +51,22 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> ClientResult<()> {
-    let state = Arc::new(RwLock::new(AppState::default()));
-
-    let tui_handler = tokio::spawn(tui(state.clone()));
-    let events_handler = tokio::spawn(ui_events(state));
-
-    /*
     // Get auth data from .env file
     dotenv::dotenv().unwrap();
     let session_id = env::var("session_id").unwrap();
     let user_id = env::var("user_id").unwrap().parse().unwrap();
     let homeserver = env::var("homeserver").unwrap().parse().unwrap();
+    let channel_id = env::var("channel_id").unwrap().parse().unwrap(); // temporary
+    let guild_id = env::var("guild_id").unwrap().parse().unwrap(); // temporary
+
+    let state = Arc::new(RwLock::new(AppState::default()));
+    state.write().await.current_channel = channel_id;
+    state.write().await.current_guild = guild_id;
+
+    let (tx, mut rx) = mpsc::channel(128);
+
+    tokio::spawn(tui(state.clone()));
+    tokio::spawn(ui_events(state.clone(), tx));
 
     // Create client
     let client = Client::new(homeserver, Some(Session::new(user_id, session_id))).await.unwrap();
@@ -78,33 +90,34 @@ async fn main() -> ClientResult<()> {
     let client = Arc::new(client);
 
     tokio::spawn(receive_events(client.clone(), events));
-    */
 
-    while RUNNING.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_micros(200)).await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            ClientEvent::Send(msg) => {
+                let state = state.read().await;
+                client.call(SendMessageRequest::new(state.current_guild, state.current_channel, Some(harmony_rust_sdk::api::chat::Content::new(Some(Content::new_text_message(TextContent::new(Some(FormattedText::new(msg, vec![]))))))), None, None, None, None)).await.unwrap();
+            }
+
+            ClientEvent::Quit => break,
+        }
     }
 
-    /*
     // Change our account's status back to offline
     client
         .call(UpdateProfile::default().with_new_status(UserStatus::OfflineUnspecified))
         .await.unwrap();
-    */
 
-    events_handler.abort();
-    tui_handler.await.unwrap().unwrap();
     std::process::exit(0);
 }
 
 async fn receive_events(client: Arc<Client>, events: Vec<EventSource>) {
     client
         .event_loop(events, {
-            move |_client, event| {
+            move |_client, _event| {
                 async move {
                     if !RUNNING.load(Ordering::Acquire) {
                         Ok(true)
                     } else {
-                        println!("{:?}", event);
                         Ok(false)
                     }
                 }
@@ -208,7 +221,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-async fn ui_events(state: Arc<RwLock<AppState>>) {
+async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) {
     while let Ok(Ok(event)) = tokio::task::spawn_blocking(crossterm::event::read).await {
         let mode = state.read().await.mode;
         match event {
@@ -253,6 +266,16 @@ async fn ui_events(state: Arc<RwLock<AppState>>) {
                                 state.command.clear();
                                 state.command_byte_pos = 0;
                                 state.command_char_pos = 0;
+                            }
+
+                            KeyCode::Enter => {
+                                let mut state = state.write().await;
+                                let mut message = String::new();
+                                std::mem::swap(&mut message, &mut state.input);
+                                state.input_byte_pos = 0;
+                                state.input_char_pos = 0;
+
+                                let _ = tx.send(ClientEvent::Send(message)).await;
                             }
 
                             _ => (),
@@ -328,7 +351,10 @@ async fn ui_events(state: Arc<RwLock<AppState>>) {
                             KeyCode::Enter => {
                                 state.write().await.mode = AppMode::TextNormal;
                                 match state.read().await.command.as_str() {
-                                    "q" | "quit" => RUNNING.store(false, Ordering::Release),
+                                    "q" | "quit" => {
+                                        RUNNING.store(false, Ordering::Release);
+                                        let _ = tx.send(ClientEvent::Quit).await;
+                                    }
                                     _ => (),
                                 }
                             }
