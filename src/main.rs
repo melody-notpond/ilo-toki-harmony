@@ -14,17 +14,28 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::Duration;
 use tui::{backend::CrosstermBackend, Terminal, widgets, layout, text::{Spans, Span, Text}};
 
+/// Determines whether the program is currently running or not
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
+/// Represents an event sent by the user from the UI to other parts of the program.
 enum ClientEvent {
+    /// Quits the program.
     Quit,
+
+    /// Sends a text message to the current channel.
     Send(String),
 }
 
 #[derive(Copy, Clone)]
+/// The current mode of the application.
 enum AppMode{
+    /// Normal mode for text.
     TextNormal,
+
+    /// Insert mode for text.
     TextInsert,
+
+    /// Command mode to enter commands.
     Command,
 }
 
@@ -34,30 +45,55 @@ impl Default for AppMode {
     }
 }
 
+/// Represents the contents of a received message.
 enum MessageContent {
+    /// A message composed of text.
     Text(String),
 }
 
+/// Represents a received message.
 struct Message {
+    /// The user id of the author.
     author_id: u64,
+
+    /// The username of the author of the message.
     author: String,
+
+    /// The content of the message.
     content: MessageContent,
 }
 
 #[derive(Default)]
+/// Represents the current state of the app.
 struct AppState {
+    /// The current mode the app is in.
     mode: AppMode,
 
+    /// TEMP: The list of messages in the current channel.
     messages: Vec<Message>,
 
+    /// The current channel being viewed.
     current_channel: u64,
+
+    /// The current guild being viewed.
     current_guild: u64,
 
+    /// The input box.
     input: String,
+
+    /// The current byte position of the cursor in the input box.
     input_byte_pos: usize,
+
+    /// The current character position of the cursor in the input box.
     input_char_pos: usize,
+
+    /// The command prompt.
     command: String,
+
+    /// The current byte position of the cursor in the command prompt.
     command_byte_pos: usize,
+
+    /// The current character position of the cursor in the command prompt.
     command_char_pos: usize,
 }
 
@@ -71,12 +107,15 @@ async fn main() -> ClientResult<()> {
     let channel_id = env::var("channel_id").unwrap().parse().unwrap(); // temporary
     let guild_id = env::var("guild_id").unwrap().parse().unwrap(); // temporary
 
+    // Set up the state
     let state = Arc::new(RwLock::new(AppState::default()));
     state.write().await.current_channel = channel_id;
     state.write().await.current_guild = guild_id;
 
+    // Create a mpsc channel
     let (tx, mut rx) = mpsc::channel(128);
 
+    // Spawn UI stuff
     tokio::spawn(tui(state.clone()));
     tokio::spawn(ui_events(state.clone(), tx));
 
@@ -95,21 +134,25 @@ async fn main() -> ClientResult<()> {
     // Our account's user id
     //let self_id = client.auth_status().session().unwrap().user_id;
 
+    // Event filters
     //let guilds = client.call(GetGuildListRequest::default()).await.unwrap();
     let events = vec![EventSource::Homeserver, EventSource::Action, EventSource::Guild(guild_id)];
     //events.extend(guilds.guilds.iter().map(|v| EventSource::Guild(v.guild_id)));
 
+    // Spawn event loop
     let client = Arc::new(client);
-
     tokio::spawn(receive_events(state.clone(), client.clone(), events));
 
+    // Send events
     while let Some(event) = rx.recv().await {
         match event {
+            // Send messages
             ClientEvent::Send(msg) => {
                 let state = state.read().await;
                 client.call(SendMessageRequest::new(state.current_guild, state.current_channel, Some(chat::Content::new(Some(Content::new_text_message(TextContent::new(Some(FormattedText::new(msg, vec![]))))))), None, None, None, None)).await.unwrap();
             }
 
+            // Quit
             ClientEvent::Quit => break,
         }
     }
@@ -119,31 +162,45 @@ async fn main() -> ClientResult<()> {
         .call(UpdateProfile::default().with_new_status(UserStatus::OfflineUnspecified))
         .await.unwrap();
 
+    // Die! :D
     std::process::exit(0);
 }
 
+/// Event loop to process incoming events.
 async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, events: Vec<EventSource>) {
     client.event_loop(events, {
         move |_client, event| {
+            // This has to be done for ownership reasons
             let state2 = state.clone();
+
             async move {
+                // Stop if not running
                 if !RUNNING.load(Ordering::Acquire) {
                     Ok(true)
                 } else {
                     match event {
+                        // Chat events
                         chat::Event::Chat(event) => {
                             match event {
                                 chat::stream_event::Event::GuildAddedToList(_) => {}
                                 chat::stream_event::Event::GuildRemovedFromList(_) => {}
                                 chat::stream_event::Event::ActionPerformed(_) => {}
 
+                                // Received a message
                                 chat::stream_event::Event::SentMessage(message) => {
+                                    // Get state
                                     let mut state = state2.write().await;
+
+                                    // TEMP: check if message belongs to current channel before
+                                    // adding
                                     if message.guild_id == state.current_guild && message.channel_id == state.current_channel {
+                                        // Get message
                                         if let Some(message) = message.message {
+                                            // Get content
                                             if let Some(content) = message.content {
                                                 if let Some(content) = content.content {
                                                     match content {
+                                                        // Text message
                                                         Content::TextMessage(text) => {
                                                             if let Some(text) = text.content {
                                                                 state.messages.push(Message {
@@ -154,6 +211,7 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
                                                             }
                                                         }
 
+                                                        // TODO
                                                         Content::EmbedMessage(_) => {}
                                                         Content::AttachmentMessage(_) => {}
                                                         Content::PhotoMessage(_) => {}
@@ -167,6 +225,7 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
                                     }
                                 }
 
+                                // TODO
                                 chat::stream_event::Event::EditedMessage(_) => {}
                                 chat::stream_event::Event::DeletedMessage(_) => {}
                                 chat::stream_event::Event::CreatedChannel(_) => {}
@@ -196,11 +255,9 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
                             }
                         }
 
-                        chat::Event::Profile(_) => {
-                        }
-
-                        chat::Event::Emote(_) => {
-                        }
+                        // TODO
+                        chat::Event::Profile(_) => {}
+                        chat::Event::Emote(_) => {}
                     }
                     Ok(false)
                 }
@@ -209,7 +266,9 @@ async fn receive_events(state: Arc<RwLock<AppState>>, client: Arc<Client>, event
     }).await.unwrap();
 }
 
+/// Handles rendering the terminal UI.
 async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
+    // Set up
     let stdout = std::io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut stdout = std::io::stdout();
@@ -217,6 +276,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
     crossterm::terminal::enable_raw_mode()?;
     terminal.clear()?;
 
+    // Draw
     while RUNNING.load(Ordering::Acquire) {
         let state = state.read().await;
         terminal.draw(|f| {
@@ -238,6 +298,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 ])
                 .split(horizontal[0]);
 
+            // Generate input text
             let input_text = {
                 Text::from({
                     let width = horizontal[1].width as usize - 2;
@@ -253,6 +314,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 })
             };
 
+            // More layout stuff
             let content = layout::Layout::default()
                 .direction(layout::Direction::Vertical)
                 .constraints([
@@ -262,22 +324,31 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 ])
                 .split(horizontal[1]);
 
+            // Guild list
             let servers = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
             f.render_widget(servers, sidebar[0]);
 
+            // Channel list
             let channels = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
             f.render_widget(channels, sidebar[1]);
 
+            // Messages
             let messages = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
 
+            // Format current list of messages
             let messages_list: Vec<_> = state.messages.iter().rev().map(|v| {
                 widgets::ListItem::new(Text::from({
                     let inner = messages.inner(content[0]);
-                    let mut result = vec![Spans::from(Span::raw(v.author.as_str()))];
+
+                    // Metadata
+                    let mut result = vec![Spans::from(""), Spans::from(Span::raw(v.author.as_str()))];
+
+                    // Content
                     match &v.content {
+                        // Text wraps
                         MessageContent::Text(text) => {
                             let mut i = 0;
                             while i + (inner.width as usize) < text.len() {
@@ -292,11 +363,13 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 }))
             }).collect();
 
+            // Render messages
             let messages = widgets::List::new(messages_list)
                 .block(messages)
                 .start_corner(layout::Corner::BottomLeft);
             f.render_widget(messages, content[0]);
 
+            // Input
             let input = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
 
@@ -304,6 +377,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 .block(input);
             f.render_widget(input, content[1]);
 
+            // Status bar (mode and who is typing)
             let status = {
                 match state.mode {
                     AppMode::TextNormal => widgets::Paragraph::new("normal"),
@@ -319,7 +393,9 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             };
             f.render_widget(status, content[2]);
 
+            // Cursor stuff is dependent on mode
             match state.mode {
+                // Normal mode -> draw cursor as a block in input
                 AppMode::TextNormal => {
                     use crossterm::cursor::{CursorShape, SetCursorShape};
                     execute!(stdout, SetCursorShape(CursorShape::Block)).unwrap();
@@ -331,6 +407,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     }
                 }
 
+                // Insert mode -> draw cursor as a line in input
                 AppMode::TextInsert => {
                     use crossterm::cursor::{CursorShape, SetCursorShape};
                     execute!(stdout, SetCursorShape(CursorShape::Line)).unwrap();
@@ -342,6 +419,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     }
                 }
 
+                // Command mode -> draw cursor as a line in prompt
                 AppMode::Command => {
                     use crossterm::cursor::{CursorShape, SetCursorShape};
                     execute!(stdout, SetCursorShape(CursorShape::Line)).unwrap();
@@ -350,9 +428,11 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             }
         })?;
 
+        // Good night! :3
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // Reset terminal
     terminal.clear()?;
     crossterm::terminal::disable_raw_mode()?;
     terminal.set_cursor(0, 0)?;
@@ -360,19 +440,27 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Handles UI events such as key presses and mouse events.
 async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) {
+    // Event loop
     while let Ok(Ok(event)) = tokio::task::spawn_blocking(crossterm::event::read).await {
+        // Get mode
         let mode = state.read().await.mode;
         match event {
+            // Key events
             crossterm::event::Event::Key(key) => {
                 match mode {
+                    // Normal mode
                     AppMode::TextNormal => {
                         match key.code {
+                            // Enter insert mode
                             KeyCode::Char('i') => {
                                 state.write().await.mode = AppMode::TextInsert;
                             }
 
                             // TODO: up/down
+
+                            // Move left
                             KeyCode::Char('h') | KeyCode::Left => {
                                 let mut state = state.write().await;
 
@@ -386,6 +474,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Move right
                             KeyCode::Char('l') | KeyCode::Right => {
                                 let mut state = state.write().await;
 
@@ -399,6 +488,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Enter command prompt
                             KeyCode::Char(':') => {
                                 let mut state = state.write().await;
                                 state.mode = AppMode::Command;
@@ -407,6 +497,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 state.command_char_pos = 0;
                             }
 
+                            // Send message
                             KeyCode::Enter => {
                                 let mut state = state.write().await;
                                 let mut message = String::new();
@@ -418,17 +509,22 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 let _ = tx.send(ClientEvent::Send(message)).await;
                             }
 
+                            // Don't do anything on invalid input
                             _ => (),
                         }
                     }
 
+                    // Insert mode
                     AppMode::TextInsert => {
                         match key.code {
+                            // Exit insert mode into normal mode
                             KeyCode::Esc => {
                                 state.write().await.mode = AppMode::TextNormal;
                             }
 
                             // TODO: up/down
+
+                            // Move left
                             KeyCode::Left => {
                                 let mut state = state.write().await;
 
@@ -442,6 +538,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Move right
                             KeyCode::Right => {
                                 let mut state = state.write().await;
 
@@ -455,6 +552,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Backspace
                             KeyCode::Backspace => {
                                 let mut state = state.write().await;
 
@@ -470,6 +568,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Insert character
                             KeyCode::Char(c) => {
                                 let mut state = state.write().await;
                                 let pos = state.input_byte_pos;
@@ -478,6 +577,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 state.input_char_pos += 1;
                             }
 
+                            // Send message
                             KeyCode::Enter => {
                                 let mut state = state.write().await;
                                 let mut message = String::new();
@@ -488,16 +588,20 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 let _ = tx.send(ClientEvent::Send(message)).await;
                             }
 
+                            // Nothing else is valid
                             _ => (),
                         }
                     }
 
+                    // Command mode
                     AppMode::Command => {
                         match key.code {
+                            // Exit command mode into normal mode
                             KeyCode::Esc => {
                                 state.write().await.mode = AppMode::TextNormal;
                             }
 
+                            // Process command
                             KeyCode::Enter => {
                                 state.write().await.mode = AppMode::TextNormal;
                                 match state.read().await.command.as_str() {
@@ -510,6 +614,8 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             }
 
                             // TODO: up/down to scroll through history
+
+                            // Move left
                             KeyCode::Left => {
                                 let mut state = state.write().await;
 
@@ -523,6 +629,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Move right
                             KeyCode::Right => {
                                 let mut state = state.write().await;
 
@@ -536,6 +643,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Backspace
                             KeyCode::Backspace => {
                                 let mut state = state.write().await;
 
@@ -553,6 +661,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Insert character
                             KeyCode::Char(c) => {
                                 let mut state = state.write().await;
                                 let pos = state.command_byte_pos;
@@ -561,16 +670,19 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 state.command_char_pos += 1;
                             }
 
+                            // Invalid does nothing
                             _ => (),
                         }
                     }
                 }
             }
 
+            // Mouse events
             crossterm::event::Event::Mouse(_) => {
                 // TODO: mouse events
             }
 
+            // Ignore this
             crossterm::event::Event::Resize(_, _) => (),
         }
     }
