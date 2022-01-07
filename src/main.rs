@@ -273,7 +273,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             let messages = widgets::Block::default()
                 .borders(widgets::Borders::ALL);
 
-            let messages_list: Vec<_> = state.messages.iter().map(|v| {
+            let messages_list: Vec<_> = state.messages.iter().rev().map(|v| {
                 widgets::ListItem::new(Text::from({
                     let inner = messages.inner(content[0]);
                     let mut result = vec![Spans::from(Span::raw(v.author.as_str()))];
@@ -293,7 +293,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             }).collect();
 
             let messages = widgets::List::new(messages_list)
-                .block(messages);
+                .block(messages)
+                .start_corner(layout::Corner::BottomLeft);
             f.render_widget(messages, content[0]);
 
             let input = widgets::Block::default()
