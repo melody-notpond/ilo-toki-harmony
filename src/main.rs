@@ -39,7 +39,7 @@ use tui::{
     backend::CrosstermBackend,
     layout,
     text::{Span, Spans, Text},
-    widgets, Terminal, style::{Style, Color},
+    widgets, Terminal, style::{Style, Color, Modifier},
 };
 
 /// Determines whether the program is currently running or not
@@ -542,13 +542,15 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             let messages = widgets::Block::default().borders(widgets::Borders::ALL);
 
             // Format current list of messages
+            let header = Style::default()
+                .add_modifier(Modifier::BOLD);
             let messages_list: Vec<_> = state
                 .messages_list
                 .iter()
                 .rev()
                 .filter_map(|v| {
                         let inner = messages.inner(content[0]);
-                        let mut result = vec![Spans::from("")];
+                        let mut result = vec![];
                     if let Some(v) = state.messages_map.get(v) {
                         // Metadata
                         let (author, is_bot) = state
@@ -556,18 +558,18 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                             .get(&v.author_id)
                             .map(|v| (v.name.as_str(), v.is_bot))
                             .unwrap_or(("<unknown user>", true));
-                        let mut metadata = vec![Span::raw(author)];
+                        let mut metadata = vec![Span::styled(author, header)];
 
                         if is_bot {
-                            metadata.push(Span::raw(" [BOT]"));
+                            metadata.push(Span::styled(" [BOT]", header));
                         }
                         let time: DateTime<Local> =
                             DateTime::from(UNIX_EPOCH + Duration::from_secs(v.timestamp));
                         let format = time.format(" - %H:%M (%x)").to_string();
-                        metadata.push(Span::raw(format));
+                        metadata.push(Span::styled(format, header));
 
                         if v.edited_timestamp.is_some() {
-                            metadata.push(Span::raw(" (edited)"));
+                            metadata.push(Span::styled(" (edited)", header));
                         }
                         result.push(Spans::from(metadata));
 
