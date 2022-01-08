@@ -19,7 +19,7 @@ use harmony_rust_sdk::{
             content::{Content, TextContent},
             get_channel_messages_request::Direction,
             EventSource, FormattedText, GetGuildListRequest, GetGuildMembersRequest,
-            GetMessageRequest, Message as RawMessage, SendMessageRequest,
+            Message as RawMessage, SendMessageRequest,
         },
         profile::GetProfileRequest,
     },
@@ -39,7 +39,7 @@ use tui::{
     backend::CrosstermBackend,
     layout,
     text::{Span, Spans, Text},
-    widgets, Terminal,
+    widgets, Terminal, style::{Style, Color},
 };
 
 /// Determines whether the program is currently running or not
@@ -52,6 +52,13 @@ enum ClientEvent {
 
     /// Sends a text message to the current channel.
     Send(String),
+
+    /// Gets more messages from the current channel.
+    ///
+    /// arg0 - guild id
+    /// arg1 - channel id
+    /// arg2 - message id
+    GetMoreMessages(u64, u64, Option<u64>),
 }
 
 #[derive(Copy, Clone)]
@@ -65,6 +72,9 @@ enum AppMode {
 
     /// Command mode to enter commands.
     Command,
+
+    /// Scroll mode to scroll through messages.
+    Scroll,
 }
 
 impl Default for AppMode {
@@ -99,9 +109,6 @@ struct Message {
 
 /// Represents a member of a guild.
 struct Member {
-    /// The id of the member
-    id: u64,
-
     /// The name of the member
     name: String,
 
@@ -128,6 +135,9 @@ struct AppState {
 
     /// The current guild being viewed.
     current_guild: u64,
+
+    /// The offset from the bottom for scrolling.
+    scroll_selected: usize,
 
     /// The input box.
     input: String,
@@ -198,7 +208,6 @@ async fn main() -> ClientResult<()> {
                 state.users.insert(
                     member,
                     Member {
-                        id: member,
                         name: profile.user_name,
                         is_bot: profile.is_bot,
                     },
@@ -220,7 +229,7 @@ async fn main() -> ClientResult<()> {
         for message in messages.messages.into_iter().rev() {
             let id = message.message_id;
             if let Some(message) = message.message {
-                handle_message(&mut state, message, id);
+                handle_message(&mut state, message, id, usize::MAX);
             }
         }
     }
@@ -265,6 +274,29 @@ async fn main() -> ClientResult<()> {
 
             // Quit
             ClientEvent::Quit => break,
+
+            // Get more messages
+            ClientEvent::GetMoreMessages(guild_id, channel_id, message_id) => {
+                // Construct request
+                let mut request = GetChannelMessages::new(guild_id, channel_id)
+                    .with_direction(Some(Direction::BeforeUnspecified))
+                    .with_count(51);
+                if let Some(message_id) = message_id {
+                    request = request.with_message_id(message_id);
+                }
+
+                // Get the messages
+                let messages = client.call(request).await.unwrap();
+
+                // Save the messages
+                let mut state = state.write().await;
+                for message in messages.messages.into_iter().skip(1) {
+                    let id = message.message_id;
+                    if let Some(message) = message.message {
+                        handle_message(&mut state, message, id, 0);
+                    }
+                }
+            }
         }
     }
 
@@ -278,7 +310,7 @@ async fn main() -> ClientResult<()> {
     std::process::exit(0);
 }
 
-fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessage, id: u64) {
+fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessage, id: u64, index: usize) {
     // Get content
     if let Some(content) = message.content {
         if let Some(content) = content.content {
@@ -293,7 +325,13 @@ fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessag
                             timestamp: message.created_at,
                             edited_timestamp: message.edited_at,
                         };
-                        state.messages_list.push(id);
+
+                        if index >= state.messages_list.len() {
+                            state.messages_list.push(id);
+                        } else {
+                            state.messages_list.insert(index, id);
+                        }
+
                         state.messages_map.insert(id, message);
                     }
                 }
@@ -347,7 +385,7 @@ async fn receive_events(
                                             // Get message
                                             let id = message.message_id;
                                             if let Some(message) = message.message {
-                                                handle_message(&mut state, message, id);
+                                                handle_message(&mut state, message, id, usize::MAX);
                                             }
                                         }
                                     }
@@ -557,8 +595,15 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             // Render messages
             let messages = widgets::List::new(messages_list)
                 .block(messages)
-                .start_corner(layout::Corner::BottomLeft);
-            f.render_widget(messages, content[0]);
+                .start_corner(layout::Corner::BottomLeft)
+                .highlight_style(Style::default().bg(Color::Yellow));
+            let mut list_state = widgets::ListState::default();
+            list_state.select(if matches!(state.mode, AppMode::Scroll) {
+                Some(state.scroll_selected)
+            } else {
+                None
+            });
+            f.render_stateful_widget(messages, content[0], &mut list_state);
 
             // Input
             let input = widgets::Block::default().borders(widgets::Borders::ALL);
@@ -571,6 +616,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 match state.mode {
                     AppMode::TextNormal => widgets::Paragraph::new("normal"),
                     AppMode::TextInsert => widgets::Paragraph::new("insert"),
+                    AppMode::Scroll => widgets::Paragraph::new("scroll"),
 
                     AppMode::Command => widgets::Paragraph::new(Spans::from(vec![
                         Span::raw(":"),
@@ -631,6 +677,9 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                         content[2].y + 1,
                     );
                 }
+
+                // Scroll mode -> don't draw cursor
+                AppMode::Scroll => (),
             }
         })?;
 
@@ -662,6 +711,11 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             // Enter insert mode
                             KeyCode::Char('i') => {
                                 state.write().await.mode = AppMode::TextInsert;
+                            }
+
+                            // Enter scroll mode
+                            KeyCode::Char('s') => {
+                                state.write().await.mode = AppMode::Scroll;
                             }
 
                             // TODO: up/down
@@ -887,6 +941,48 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                             // Invalid does nothing
                             _ => (),
+                        }
+                    }
+
+                    // Scroll mode
+                    AppMode::Scroll => {
+                        match key.code {
+                            // Escape exits to normal mode
+                            KeyCode::Esc => {
+                                state.write().await.mode = AppMode::TextNormal;
+                            }
+
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let mut state = state.write().await;
+                                if state.scroll_selected < state.messages_list.len() {
+                                    state.scroll_selected += 1;
+
+                                    if state.scroll_selected == state.messages_list.len() {
+                                        let _ = tx.send(ClientEvent::GetMoreMessages(state.current_guild, state.current_channel, state.messages_list.first().and_then(|v| state.messages_map.get(v)).map(|v| v.id))).await;
+                                    }
+                                }
+                            }
+
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let mut state = state.write().await;
+                                if state.scroll_selected > 0 {
+                                    state.scroll_selected -= 1;
+                                }
+                            }
+
+                            KeyCode::Char('g') => {
+                                let mut state = state.write().await;
+                                state.scroll_selected = state.messages_list.len() - 1;
+                            }
+
+                            KeyCode::Char('G') => {
+                                state.write().await.scroll_selected = 0;
+                            }
+
+                            // TODO: more controls
+
+                            // Nothing
+                            _ => ()
                         }
                     }
                 }
