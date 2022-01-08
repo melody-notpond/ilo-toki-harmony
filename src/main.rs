@@ -81,6 +81,9 @@ enum MessageContent {
 
 /// Represents a received message.
 struct Message {
+    /// The id of the message.
+    id: u64,
+
     /// The user id of the author.
     author_id: u64,
 
@@ -89,6 +92,9 @@ struct Message {
 
     /// The timestamp the message was created at.
     timestamp: u64,
+
+    /// The timestamp the message was edited at.
+    edited_timestamp: Option<u64>,
 }
 
 /// Represents a member of a guild.
@@ -110,7 +116,9 @@ struct AppState {
     mode: AppMode,
 
     /// TEMP: The list of messages in the current channel.
-    messages: Vec<Message>,
+    messages_map: HashMap<u64, Message>,
+
+    messages_list: Vec<u64>,
 
     /// The map of users.
     users: HashMap<u64, Member>,
@@ -210,8 +218,9 @@ async fn main() -> ClientResult<()> {
     {
         let mut state = state.write().await;
         for message in messages.messages.into_iter().rev() {
+            let id = message.message_id;
             if let Some(message) = message.message {
-                handle_message(&mut state, message).await;
+                handle_message(&mut state, message, id);
             }
         }
     }
@@ -269,7 +278,7 @@ async fn main() -> ClientResult<()> {
     std::process::exit(0);
 }
 
-async fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessage) {
+fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessage, id: u64) {
     // Get content
     if let Some(content) = message.content {
         if let Some(content) = content.content {
@@ -277,11 +286,15 @@ async fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: Raw
                 // Text message
                 Content::TextMessage(text) => {
                     if let Some(text) = text.content {
-                        state.messages.push(Message {
+                        let message = Message {
+                            id,
                             author_id: message.author_id,
                             content: MessageContent::Text(text.text),
                             timestamp: message.created_at,
-                        });
+                            edited_timestamp: message.edited_at,
+                        };
+                        state.messages_list.push(id);
+                        state.messages_map.insert(id, message);
                     }
                 }
 
@@ -332,15 +345,54 @@ async fn receive_events(
                                             && message.channel_id == state.current_channel
                                         {
                                             // Get message
+                                            let id = message.message_id;
                                             if let Some(message) = message.message {
-                                                handle_message(&mut state, message).await;
+                                                handle_message(&mut state, message, id);
                                             }
                                         }
                                     }
 
+                                    // Edited a message
+                                    chat::stream_event::Event::EditedMessage(message) => {
+                                        // Get state
+                                        let mut state = state2.write().await;
+
+                                        // TEMP: check if message belongs to current channel before deleting
+                                        if message.guild_id == state.current_guild
+                                            && message.channel_id == state.current_channel
+                                        {
+                                            // Edit
+                                            let id = message.message_id;
+                                            let edited_at = message.edited_at;
+                                            if let Some(content) = message.new_content {
+                                                if let Some(message) = state.messages_map.get_mut(&id) {
+                                                    // TODO: more patterns
+                                                    #[allow(irrefutable_let_patterns)]
+                                                    if let MessageContent::Text(_) = message.content {
+                                                        message.content = MessageContent::Text(content.text);
+                                                        message.edited_timestamp = Some(edited_at);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Deleted a message
+                                    chat::stream_event::Event::DeletedMessage(message) => {
+                                        // Get state
+                                        let mut state = state2.write().await;
+
+                                        // TEMP: check if message belongs to current channel before deleting
+                                        if message.guild_id == state.current_guild
+                                            && message.channel_id == state.current_channel
+                                        {
+                                            // Delete
+                                            let id = message.message_id;
+                                            state.messages_map.remove(&id);
+                                        }
+                                    }
+
                                     // TODO
-                                    chat::stream_event::Event::EditedMessage(_) => {}
-                                    chat::stream_event::Event::DeletedMessage(_) => {}
                                     chat::stream_event::Event::CreatedChannel(_) => {}
                                     chat::stream_event::Event::EditedChannel(_) => {}
                                     chat::stream_event::Event::DeletedChannel(_) => {}
@@ -453,14 +505,13 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
 
             // Format current list of messages
             let messages_list: Vec<_> = state
-                .messages
+                .messages_list
                 .iter()
                 .rev()
-                .map(|v| {
-                    widgets::ListItem::new(Text::from({
+                .filter_map(|v| {
                         let inner = messages.inner(content[0]);
                         let mut result = vec![Spans::from("")];
-
+                    if let Some(v) = state.messages_map.get(v) {
                         // Metadata
                         let (author, is_bot) = state
                             .users
@@ -468,6 +519,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                             .map(|v| (v.name.as_str(), v.is_bot))
                             .unwrap_or(("<unknown user>", true));
                         let mut metadata = vec![Span::raw(author)];
+
                         if is_bot {
                             metadata.push(Span::raw(" [BOT]"));
                         }
@@ -475,6 +527,10 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                             DateTime::from(UNIX_EPOCH + Duration::from_secs(v.timestamp));
                         let format = time.format(" - %H:%M (%x)").to_string();
                         metadata.push(Span::raw(format));
+
+                        if v.edited_timestamp.is_some() {
+                            metadata.push(Span::raw(" (edited)"));
+                        }
                         result.push(Spans::from(metadata));
 
                         // Content
@@ -490,9 +546,12 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                             }
                         }
 
-                        result
-                    }))
+                        Some(result)
+                    } else {
+                        None
+                    }
                 })
+                .map(|v| widgets::ListItem::new(Text::from(v)))
                 .collect();
 
             // Render messages
