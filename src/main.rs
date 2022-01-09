@@ -19,7 +19,7 @@ use harmony_rust_sdk::{
             content::{Content, TextContent},
             get_channel_messages_request::Direction,
             EventSource, FormattedText, GetGuildListRequest, GetGuildMembersRequest,
-            Message as RawMessage, SendMessageRequest, DeleteMessageRequest,
+            Message as RawMessage, SendMessageRequest, DeleteMessageRequest, UpdateMessageTextRequest,
         },
         profile::GetProfileRequest,
     },
@@ -62,6 +62,9 @@ enum ClientEvent {
 
     /// Deletes a message in the current channel.
     Delete(u64),
+
+    /// Edits a message in the current channel.
+    Edit(u64, String),
 }
 
 #[derive(Copy, Clone)]
@@ -149,6 +152,9 @@ struct AppState {
     /// The offset from the bottom for scrolling.
     scroll_selected: usize,
 
+    /// Determines whether or not the user is currently editing a message.
+    editing: bool,
+
     /// The input box.
     input: String,
 
@@ -157,6 +163,15 @@ struct AppState {
 
     /// The current character position of the cursor in the input box.
     input_char_pos: usize,
+
+    /// The old value of the input box before editing.
+    old_input: String,
+
+    /// The old value of the byte position of the input cursor before editing.
+    old_input_byte_pos: usize,
+
+    /// The old value of the char position of the input cursor before editing.
+    old_input_char_pos: usize,
 
     /// The command prompt.
     command: String,
@@ -329,6 +344,12 @@ async fn main() -> ClientResult<()> {
                 if let Some(i) = index {
                     state.messages_list.remove(i);
                 }
+            }
+
+            // Edit a message
+            ClientEvent::Edit(message_id, edit) => {
+                let state = state.read().await;
+                client.call(UpdateMessageTextRequest::new(state.current_guild, state.current_channel, message_id, Some(FormattedText::new(edit, vec![])))).await.unwrap();
             }
         }
     }
@@ -645,11 +666,13 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 .start_corner(layout::Corner::BottomLeft)
                 .highlight_style(Style::default().bg(if matches!(state.mode, AppMode::Delete) {
                     Color::Red
+                } else if state.editing {
+                    Color::Green
                 } else {
                     Color::Yellow
                 }));
             let mut list_state = widgets::ListState::default();
-            list_state.select(if matches!(state.mode, AppMode::Scroll | AppMode::Delete) {
+            list_state.select(if matches!(state.mode, AppMode::Scroll | AppMode::Delete) || state.editing {
                 Some(state.scroll_selected)
             } else {
                 None
@@ -761,6 +784,18 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                     // Normal mode
                     AppMode::TextNormal => {
                         match key.code {
+                            // Exit editing if editing
+                            KeyCode::Esc if state.read().await.editing => {
+                                let mut state = state.write().await;
+                                state.mode = AppMode::Scroll;
+                                state.editing = false;
+                                state.input_byte_pos = state.old_input_byte_pos;
+                                state.input_char_pos = state.old_input_char_pos;
+                                let mut temp = String::new();
+                                std::mem::swap(&mut temp, &mut state.old_input);
+                                std::mem::swap(&mut temp, &mut state.input);
+                            }
+
                             // Enter insert mode
                             KeyCode::Char('i') => {
                                 state.write().await.mode = AppMode::TextInsert;
@@ -812,14 +847,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                             // Send message
                             KeyCode::Enter => {
-                                let mut state = state.write().await;
-                                let mut message = String::new();
-                                std::mem::swap(&mut message, &mut state.input);
-                                state.input_byte_pos = 0;
-                                state.input_char_pos = 0;
-                                state.mode = AppMode::TextInsert;
-
-                                let _ = tx.send(ClientEvent::Send(message)).await;
+                                send_message(&state, &tx).await;
                             }
 
                             // Don't do anything on invalid input
@@ -892,13 +920,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                             // Send message
                             KeyCode::Enter => {
-                                let mut state = state.write().await;
-                                let mut message = String::new();
-                                std::mem::swap(&mut message, &mut state.input);
-                                state.input_byte_pos = 0;
-                                state.input_char_pos = 0;
-
-                                let _ = tx.send(ClientEvent::Send(message)).await;
+                                send_message(&state, &tx).await;
                             }
 
                             // Nothing else is valid
@@ -1005,6 +1027,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 state.write().await.mode = AppMode::TextNormal;
                             }
 
+                            // Scroll up
                             KeyCode::Up | KeyCode::Char('k') => {
                                 let mut state = state.write().await;
                                 if state.scroll_selected < state.messages_list.len() {
@@ -1016,6 +1039,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Scroll down
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let mut state = state.write().await;
                                 if state.scroll_selected > 0 {
@@ -1023,21 +1047,58 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 }
                             }
 
+                            // Go to top
                             KeyCode::Char('g') => {
                                 let mut state = state.write().await;
                                 state.scroll_selected = state.messages_list.len() - 1;
                             }
 
+                            // Go to bottom
                             KeyCode::Char('G') => {
                                 state.write().await.scroll_selected = 0;
                             }
 
+                            // Delete message without prompt
                             KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
                                 delete_message(&state, &tx).await;
                             }
 
+                            // Delete message with prompt
                             KeyCode::Char('d') => {
                                 state.write().await.mode = AppMode::Delete;
+                            }
+
+                            // Edit message
+                            KeyCode::Char('e') => {
+                                let mut state = state.write().await;
+
+                                // Get contents
+                                let mut temp = if let Some(message) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1).and_then(|v| state.messages_map.get(v)) {
+                                    if message.author_id == state.current_user {
+                                        #[allow(irrefutable_let_patterns)]
+                                        if let MessageContent::Text(text) = &message.content {
+                                            text.clone()
+                                        } else {
+                                            continue;
+                                        }
+                                    } else {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                };
+
+                                // Switch mode
+                                state.mode = AppMode::TextInsert;
+                                state.editing = true;
+
+                                // Do some moving
+                                state.old_input_byte_pos = state.input_byte_pos;
+                                state.input_byte_pos = temp.bytes().len();
+                                state.old_input_char_pos = state.input_char_pos;
+                                state.input_char_pos = temp.len();
+                                std::mem::swap(&mut temp, &mut state.input);
+                                std::mem::swap(&mut temp, &mut state.old_input);
                             }
 
                             // TODO: more controls
@@ -1047,11 +1108,14 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                         }
                     }
 
+                    // Deletion prompt
                     AppMode::Delete => {
+                        // Delete if user chose to delete
                         if let KeyCode::Char('y') = key.code {
                             delete_message(&state, &tx).await;
                         }
 
+                        // Go back to scroll mode
                         state.write().await.mode = AppMode::Scroll;
                     }
                 }
@@ -1068,13 +1132,41 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
     }
 }
 
+async fn send_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientEvent>) {
+    let mut state = state.write().await;
+    if state.editing {
+        state.editing = false;
+        let mut message = String::new();
+        std::mem::swap(&mut message, &mut state.input);
+
+        if let Some(&message_id) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1) {
+            if !message.is_empty() {
+                let _ = tx.send(ClientEvent::Edit(message_id, message)).await;
+            }
+        }
+
+        state.mode = AppMode::Scroll;
+        state.editing = false;
+        state.input_byte_pos = state.old_input_byte_pos;
+        state.input_char_pos = state.old_input_char_pos;
+        let mut temp = String::new();
+        std::mem::swap(&mut temp, &mut state.old_input);
+        std::mem::swap(&mut temp, &mut state.input);
+    } else {
+        let mut message = String::new();
+        std::mem::swap(&mut message, &mut state.input);
+        state.input_byte_pos = 0;
+        state.input_char_pos = 0;
+
+        let _ = tx.send(ClientEvent::Send(message)).await;
+    }
+}
+
 async fn delete_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientEvent>) {
     let state = state.read().await;
-    if let Some(&message_id) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1) {
-        if let Some(message) = state.messages_map.get(&message_id) {
-            if message.author_id == state.current_user {
-                let _ = tx.send(ClientEvent::Delete(message_id)).await;
-            }
+    if let Some(message) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1).and_then(|v| state.messages_map.get(v)) {
+        if message.author_id == state.current_user {
+            let _ = tx.send(ClientEvent::Delete(message.id)).await;
         }
     }
 }
