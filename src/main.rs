@@ -9,7 +9,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local};
-use crossterm::{event::KeyCode, execute};
+use crossterm::{event::{KeyCode, KeyModifiers}, execute};
 
 use harmony_rust_sdk::{
     api::{
@@ -19,7 +19,7 @@ use harmony_rust_sdk::{
             content::{Content, TextContent},
             get_channel_messages_request::Direction,
             EventSource, FormattedText, GetGuildListRequest, GetGuildMembersRequest,
-            Message as RawMessage, SendMessageRequest,
+            Message as RawMessage, SendMessageRequest, DeleteMessageRequest,
         },
         profile::GetProfileRequest,
     },
@@ -59,6 +59,9 @@ enum ClientEvent {
     /// arg1 - channel id
     /// arg2 - message id
     GetMoreMessages(u64, u64, Option<u64>),
+
+    /// Deletes a message in the current channel.
+    Delete(u64),
 }
 
 #[derive(Copy, Clone)]
@@ -75,6 +78,9 @@ enum AppMode {
 
     /// Scroll mode to scroll through messages.
     Scroll,
+
+    /// Delete mode to delete the selected message.
+    Delete,
 }
 
 impl Default for AppMode {
@@ -122,13 +128,17 @@ struct AppState {
     /// The current mode the app is in.
     mode: AppMode,
 
-    /// TEMP: The list of messages in the current channel.
+    /// TEMP: The map of messages in the current channel.
     messages_map: HashMap<u64, Message>,
 
+    /// TEMP: The list of messages in the current channel.
     messages_list: Vec<u64>,
 
     /// The map of users.
     users: HashMap<u64, Member>,
+
+    /// The id of the user using this application.
+    current_user: u64,
 
     /// The current channel being viewed.
     current_channel: u64,
@@ -170,6 +180,7 @@ async fn main() -> ClientResult<()> {
 
     // Set up the state
     let state = Arc::new(RwLock::new(AppState::default()));
+    state.write().await.current_user = user_id;
     state.write().await.current_channel = channel_id;
     state.write().await.current_guild = guild_id;
 
@@ -295,6 +306,28 @@ async fn main() -> ClientResult<()> {
                     if let Some(message) = message.message {
                         handle_message(&mut state, message, id, 0);
                     }
+                }
+            }
+
+            // Delete a message
+            ClientEvent::Delete(message_id) => {
+                // Request
+                let mut state = state.write().await;
+                client.call(DeleteMessageRequest::new(state.current_guild, state.current_channel, message_id)).await.unwrap();
+
+                // Remove from map
+                state.messages_map.remove(&message_id);
+
+                // Find in list and remove
+                let mut index = None;
+                for (i, &id) in state.messages_list.iter().enumerate() {
+                    if id == message_id {
+                        index = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = index {
+                    state.messages_list.remove(i);
                 }
             }
         }
@@ -427,6 +460,18 @@ async fn receive_events(
                                             // Delete
                                             let id = message.message_id;
                                             state.messages_map.remove(&id);
+
+                                            // Find in list and remove
+                                            let mut index = None;
+                                            for (i, &id2) in state.messages_list.iter().enumerate() {
+                                                if id2 == id {
+                                                    index = Some(i);
+                                                    break;
+                                                }
+                                            }
+                                            if let Some(i) = index {
+                                                state.messages_list.remove(i);
+                                            }
                                         }
                                     }
 
@@ -598,9 +643,13 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             let messages = widgets::List::new(messages_list)
                 .block(messages)
                 .start_corner(layout::Corner::BottomLeft)
-                .highlight_style(Style::default().bg(Color::Yellow));
+                .highlight_style(Style::default().bg(if matches!(state.mode, AppMode::Delete) {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                }));
             let mut list_state = widgets::ListState::default();
-            list_state.select(if matches!(state.mode, AppMode::Scroll) {
+            list_state.select(if matches!(state.mode, AppMode::Scroll | AppMode::Delete) {
                 Some(state.scroll_selected)
             } else {
                 None
@@ -624,6 +673,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                         Span::raw(":"),
                         Span::raw(state.command.as_str()),
                     ])),
+
+                    AppMode::Delete => widgets::Paragraph::new("are you sure you want to delete this message? (y/n)"),
                 }
             };
             f.render_widget(status, content[2]);
@@ -680,8 +731,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     );
                 }
 
-                // Scroll mode -> don't draw cursor
-                AppMode::Scroll => (),
+                // Scroll mode and delete mode -> don't draw cursor
+                AppMode::Scroll | AppMode::Delete => (),
             }
         })?;
 
@@ -981,11 +1032,27 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 state.write().await.scroll_selected = 0;
                             }
 
+                            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+                                delete_message(&state, &tx).await;
+                            }
+
+                            KeyCode::Char('d') => {
+                                state.write().await.mode = AppMode::Delete;
+                            }
+
                             // TODO: more controls
 
                             // Nothing
                             _ => ()
                         }
+                    }
+
+                    AppMode::Delete => {
+                        if let KeyCode::Char('y') = key.code {
+                            delete_message(&state, &tx).await;
+                        }
+
+                        state.write().await.mode = AppMode::Scroll;
                     }
                 }
             }
@@ -997,6 +1064,17 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
             // Ignore this
             crossterm::event::Event::Resize(_, _) => (),
+        }
+    }
+}
+
+async fn delete_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientEvent>) {
+    let state = state.read().await;
+    if let Some(&message_id) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1) {
+        if let Some(message) = state.messages_map.get(&message_id) {
+            if message.author_id == state.current_user {
+                let _ = tx.send(ClientEvent::Delete(message_id)).await;
+            }
         }
     }
 }
