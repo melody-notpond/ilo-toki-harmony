@@ -19,7 +19,7 @@ use harmony_rust_sdk::{
             content::{Content, TextContent},
             get_channel_messages_request::Direction,
             EventSource, FormattedText, GetGuildListRequest, GetGuildMembersRequest,
-            Message as RawMessage, SendMessageRequest, DeleteMessageRequest, UpdateMessageTextRequest,
+            Message as RawMessage, SendMessageRequest, DeleteMessageRequest, UpdateMessageTextRequest, GetGuildRequest, GuildListEntry, GetGuildChannelsRequest,
         },
         profile::GetProfileRequest,
     },
@@ -33,7 +33,7 @@ use harmony_rust_sdk::{
     },
 };
 
-use tokio::sync::{mpsc, RwLock, RwLockWriteGuard};
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::Duration;
 use tui::{
     backend::CrosstermBackend,
@@ -54,17 +54,17 @@ enum ClientEvent {
     Send(String),
 
     /// Gets more messages from the current channel.
-    ///
-    /// arg0 - guild id
-    /// arg1 - channel id
-    /// arg2 - message id
-    GetMoreMessages(u64, u64, Option<u64>),
+    /// arg0 - message id
+    GetMoreMessages(Option<u64>),
 
     /// Deletes a message in the current channel.
     Delete(u64),
 
     /// Edits a message in the current channel.
     Edit(u64, String),
+
+    /// Gets the channels of the current guild.
+    GetChannels,
 }
 
 #[derive(Copy, Clone)]
@@ -84,11 +84,17 @@ enum AppMode {
 
     /// Delete mode to delete the selected message.
     Delete,
+
+    /// Guild select mode to select a guild.
+    GuildSelect,
+
+    //// Channel select mode to select a channel.
+    //ChannelSelect,
 }
 
 impl Default for AppMode {
     fn default() -> Self {
-        Self::TextInsert
+        Self::TextNormal
     }
 }
 
@@ -125,32 +131,83 @@ struct Member {
     is_bot: bool,
 }
 
+/// Represents a channel.
+struct Channel {
+    /// The id of the channel.
+    id: u64,
+
+    /// The id of the guild that contains this channel.
+    guild_id: u64,
+
+    /// The name of the channel.
+    name: String,
+
+    /// The offset from the bottom for scrolling.
+    scroll_selected: usize,
+
+    /// The map of messages in the channel.
+    messages_map: HashMap<u64, Message>,
+
+    /// The list of messages in the channel.
+    messages_list: Vec<u64>,
+}
+
+/// Represents a guild.
+struct Guild {
+    /// The id of the guild.
+    id: u64,
+
+    /// The id of the homeserver of the guild.
+    server_id: String,
+
+    /// The list of channels.
+    channels_list: Vec<u64>,
+
+    channels_select: Option<usize>,
+
+    /// The map of channels.
+    channels_map: HashMap<u64, Channel>,
+
+    /// The name of the guild.
+    name: String,
+
+    /// The current channel being viewed.
+    current_channel: Option<u64>,
+}
+
+impl Guild {
+    fn current_channel(&self) -> Option<&Channel> {
+        self.current_channel.and_then(|v| self.channels_map.get(&v))
+    }
+
+    fn current_channel_mut(&mut self) -> Option<&mut Channel> {
+        self.current_channel.and_then(|v| self.channels_map.get_mut(&v))
+    }
+}
+
 #[derive(Default)]
 /// Represents the current state of the app.
 struct AppState {
     /// The current mode the app is in.
     mode: AppMode,
 
-    /// TEMP: The map of messages in the current channel.
-    messages_map: HashMap<u64, Message>,
-
-    /// TEMP: The list of messages in the current channel.
-    messages_list: Vec<u64>,
-
     /// The map of users.
     users: HashMap<u64, Member>,
 
-    /// The id of the user using this application.
-    current_user: u64,
+    /// The map of guilds.
+    guilds_map: HashMap<u64, Guild>,
 
-    /// The current channel being viewed.
-    current_channel: u64,
+    /// The list of guilds
+    guilds_list: Vec<u64>,
+
+    /// The currently selected guild, if any.
+    guilds_select: Option<usize>,
 
     /// The current guild being viewed.
-    current_guild: u64,
+    current_guild: Option<u64>,
 
-    /// The offset from the bottom for scrolling.
-    scroll_selected: usize,
+    /// The id of the user using this application.
+    current_user: u64,
 
     /// Determines whether or not the user is currently editing a message.
     editing: bool,
@@ -183,6 +240,32 @@ struct AppState {
     command_char_pos: usize,
 }
 
+impl AppState {
+    fn current_guild(&self) -> Option<&Guild> {
+        self.current_guild.and_then(|v| self.guilds_map.get(&v))
+    }
+
+    fn current_channel(&self) -> Option<&Channel> {
+        self.current_guild().and_then(Guild::current_channel)
+    }
+
+    fn current_guild_mut(&mut self) -> Option<&mut Guild> {
+        self.current_guild.and_then(|v| self.guilds_map.get_mut(&v))
+    }
+
+    fn current_channel_mut(&mut self) -> Option<&mut Channel> {
+        self.current_guild_mut().and_then(Guild::current_channel_mut)
+    }
+
+    fn get_channel(&self, guild_id: u64, channel_id: u64) -> Option<&Channel> {
+        self.guilds_map.get(&guild_id).and_then(|v| v.channels_map.get(&channel_id))
+    }
+
+    fn get_channel_mut(&mut self, guild_id: u64, channel_id: u64) -> Option<&mut Channel> {
+        self.guilds_map.get_mut(&guild_id).and_then(|v| v.channels_map.get_mut(&channel_id))
+    }
+}
+
 #[tokio::main]
 async fn main() -> ClientResult<()> {
     // Get auth data from .env file
@@ -190,14 +273,10 @@ async fn main() -> ClientResult<()> {
     let session_id = env::var("session_id").unwrap();
     let user_id = env::var("user_id").unwrap().parse().unwrap();
     let homeserver = env::var("homeserver").unwrap().parse().unwrap();
-    let channel_id = env::var("channel_id").unwrap().parse().unwrap(); // temporary
-    let guild_id = env::var("guild_id").unwrap().parse().unwrap(); // temporary
 
     // Set up the state
     let state = Arc::new(RwLock::new(AppState::default()));
     state.write().await.current_user = user_id;
-    state.write().await.current_channel = channel_id;
-    state.write().await.current_guild = guild_id;
 
     // Create a mpsc channel
     let (tx, mut rx) = mpsc::channel(128);
@@ -220,57 +299,37 @@ async fn main() -> ClientResult<()> {
         )
         .await
         .unwrap();
-    let members = client
-        .call(GetGuildMembersRequest::new(guild_id))
-        .await
-        .unwrap();
-
-    {
-        // Get members of the guild
-        let mut state = state.write().await;
-        for member in members.members {
-            let profile = client.call(GetProfileRequest::new(member)).await.unwrap();
-            if let Some(profile) = profile.profile {
-                state.users.insert(
-                    member,
-                    Member {
-                        name: profile.user_name,
-                        is_bot: profile.is_bot,
-                    },
-                );
-            }
-        }
-    }
-
-    let messages = client
-        .call(
-            GetChannelMessages::new(guild_id, channel_id)
-                .with_direction(Some(Direction::BeforeUnspecified))
-                .with_count(50),
-        )
-        .await
-        .unwrap();
-    {
-        let mut state = state.write().await;
-        for message in messages.messages.into_iter().rev() {
-            let id = message.message_id;
-            if let Some(message) = message.message {
-                handle_message(&mut state, message, id, usize::MAX);
-            }
-        }
-    }
 
     // Our account's user id
     //let self_id = client.auth_status().session().unwrap().user_id;
 
     // Event filters
-    //let guilds = client.call(GetGuildListRequest::default()).await.unwrap();
-    let events = vec![
+    let guilds = client.call(GetGuildListRequest::default()).await.unwrap();
+    let mut events = vec![
         EventSource::Homeserver,
         EventSource::Action,
-        EventSource::Guild(guild_id),
     ];
-    //events.extend(guilds.guilds.iter().map(|v| EventSource::Guild(v.guild_id)));
+    events.extend(guilds.guilds.iter().map(|v| EventSource::Guild(v.guild_id)));
+
+    {
+        let mut state = state.write().await;
+        for GuildListEntry { guild_id, server_id } in guilds.guilds {
+            let guild = client.call(GetGuildRequest::new(guild_id)).await.unwrap();
+            if let Some(guild) = guild.guild {
+                let guild = Guild {
+                    id: guild_id,
+                    server_id,
+                    channels_list: vec![],
+                    channels_select: None,
+                    channels_map: HashMap::new(),
+                    name: guild.name,
+                    current_channel: None,
+                };
+                state.guilds_list.push(guild_id);
+                state.guilds_map.insert(guild_id, guild);
+            }
+        }
+    }
 
     // Spawn event loop
     let client = Arc::new(client);
@@ -282,74 +341,101 @@ async fn main() -> ClientResult<()> {
             // Send messages
             ClientEvent::Send(msg) => {
                 let state = state.read().await;
-                client
-                    .call(SendMessageRequest::new(
-                        state.current_guild,
-                        state.current_channel,
-                        Some(chat::Content::new(Some(Content::new_text_message(
-                            TextContent::new(Some(FormattedText::new(msg, vec![]))),
-                        )))),
-                        None,
-                        None,
-                        None,
-                        None,
-                    ))
-                    .await
-                    .unwrap();
+                if let Some(guild) = state.current_guild() {
+                    if let Some(channel_id) = guild.current_channel {
+                        client
+                            .call(SendMessageRequest::new(
+                                guild.id,
+                                channel_id,
+                                Some(chat::Content::new(Some(Content::new_text_message(
+                                    TextContent::new(Some(FormattedText::new(msg, vec![]))),
+                                )))),
+                                None,
+                                None,
+                                None,
+                                None,
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
             }
 
             // Quit
             ClientEvent::Quit => break,
 
             // Get more messages
-            ClientEvent::GetMoreMessages(guild_id, channel_id, message_id) => {
+            ClientEvent::GetMoreMessages(message_id) => {
                 // Construct request
-                let mut request = GetChannelMessages::new(guild_id, channel_id)
-                    .with_direction(Some(Direction::BeforeUnspecified))
-                    .with_count(51);
-                if let Some(message_id) = message_id {
-                    request = request.with_message_id(message_id);
-                }
+                let request = {
+                    let state = state.read().await;
+                    if let Some(channel) = state.current_channel() {
+                        let mut request = GetChannelMessages::new(channel.guild_id, channel.id)
+                            .with_direction(Some(Direction::BeforeUnspecified))
+                            .with_count(51);
+                        if let Some(message_id) = message_id {
+                            request = request.with_message_id(message_id);
+                        }
+                        request
+                    } else {
+                        continue;
+                    }
+                };
 
                 // Get the messages
                 let messages = client.call(request).await.unwrap();
 
                 // Save the messages
                 let mut state = state.write().await;
-                for message in messages.messages.into_iter().skip(1) {
-                    let id = message.message_id;
-                    if let Some(message) = message.message {
-                        handle_message(&mut state, message, id, 0);
+                if let Some(channel) = state.current_channel_mut() {
+                    for message in messages.messages.into_iter().skip(1) {
+                        let id = message.message_id;
+                        if let Some(message) = message.message {
+                            handle_message(channel, message, id, 0);
+                        }
                     }
                 }
             }
 
             // Delete a message
             ClientEvent::Delete(message_id) => {
-                // Request
-                let mut state = state.write().await;
-                client.call(DeleteMessageRequest::new(state.current_guild, state.current_channel, message_id)).await.unwrap();
-
-                // Remove from map
-                state.messages_map.remove(&message_id);
-
-                // Find in list and remove
-                let mut index = None;
-                for (i, &id) in state.messages_list.iter().enumerate() {
-                    if id == message_id {
-                        index = Some(i);
-                        break;
+                let state = state.read().await;
+                if let Some(guild) = state.current_guild() {
+                    if let Some(channel_id) = guild.current_channel {
+                        client.call(DeleteMessageRequest::new(guild.id, channel_id, message_id)).await.unwrap();
                     }
-                }
-                if let Some(i) = index {
-                    state.messages_list.remove(i);
                 }
             }
 
             // Edit a message
             ClientEvent::Edit(message_id, edit) => {
                 let state = state.read().await;
-                client.call(UpdateMessageTextRequest::new(state.current_guild, state.current_channel, message_id, Some(FormattedText::new(edit, vec![])))).await.unwrap();
+                if let Some(guild) = state.current_guild() {
+                    if let Some(channel_id) = guild.current_channel {
+                        client.call(UpdateMessageTextRequest::new(guild.id, channel_id, message_id, Some(FormattedText::new(edit, vec![])))).await.unwrap();
+                    }
+                }
+            }
+
+            ClientEvent::GetChannels => {
+                let mut state = state.write().await;
+                if let Some(guild) = state.current_guild_mut() {
+                    let channels = client.call(GetGuildChannelsRequest::new(guild.id)).await.unwrap();
+                    for channel in channels.channels {
+                        let channel_id = channel.channel_id;
+                        if let Some(channel) = channel.channel {
+                            guild.channels_list.push(channel_id);
+                            guild.channels_map.insert(channel_id, Channel {
+                                id: channel_id,
+                                guild_id: guild.id,
+                                name: channel.channel_name,
+                                scroll_selected: 0,
+                                messages_map: HashMap::new(),
+                                messages_list: vec![],
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -364,7 +450,7 @@ async fn main() -> ClientResult<()> {
     std::process::exit(0);
 }
 
-fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessage, id: u64, index: usize) {
+fn handle_message(channel: &mut Channel, message: RawMessage, id: u64, index: usize) {
     // Get content
     if let Some(content) = message.content {
         if let Some(content) = content.content {
@@ -380,13 +466,13 @@ fn handle_message(state: &mut RwLockWriteGuard<'_, AppState>, message: RawMessag
                             edited_timestamp: message.edited_at,
                         };
 
-                        if index >= state.messages_list.len() {
-                            state.messages_list.push(id);
+                        if index >= channel.messages_list.len() {
+                            channel.messages_list.push(id);
                         } else {
-                            state.messages_list.insert(index, id);
+                            channel.messages_list.insert(index, id);
                         }
 
-                        state.messages_map.insert(id, message);
+                        channel.messages_map.insert(id, message);
                     }
                 }
 
@@ -432,14 +518,11 @@ async fn receive_events(
                                         // Get state
                                         let mut state = state2.write().await;
 
-                                        // TEMP: check if message belongs to current channel before adding
-                                        if message.guild_id == state.current_guild
-                                            && message.channel_id == state.current_channel
-                                        {
-                                            // Get message
-                                            let id = message.message_id;
+                                        // Get message
+                                        let id = message.message_id;
+                                        if let Some(channel) = state.get_channel_mut(message.guild_id, message.channel_id) {
                                             if let Some(message) = message.message {
-                                                handle_message(&mut state, message, id, usize::MAX);
+                                                handle_message(channel, message, id, usize::MAX);
                                             }
                                         }
                                     }
@@ -449,15 +532,14 @@ async fn receive_events(
                                         // Get state
                                         let mut state = state2.write().await;
 
-                                        // TEMP: check if message belongs to current channel before deleting
-                                        if message.guild_id == state.current_guild
-                                            && message.channel_id == state.current_channel
-                                        {
-                                            // Edit
-                                            let id = message.message_id;
-                                            let edited_at = message.edited_at;
+                                        // Edit
+                                        let id = message.message_id;
+                                        let edited_at = message.edited_at;
+
+                                        // Get channel
+                                        if let Some(channel) = state.get_channel_mut(message.guild_id, message.channel_id) {
                                             if let Some(content) = message.new_content {
-                                                if let Some(message) = state.messages_map.get_mut(&id) {
+                                                if let Some(message) = channel.messages_map.get_mut(&id) {
                                                     // TODO: more patterns
                                                     #[allow(irrefutable_let_patterns)]
                                                     if let MessageContent::Text(_) = message.content {
@@ -473,25 +555,23 @@ async fn receive_events(
                                     chat::stream_event::Event::DeletedMessage(message) => {
                                         // Get state
                                         let mut state = state2.write().await;
+                                        let id = message.message_id;
 
-                                        // TEMP: check if message belongs to current channel before deleting
-                                        if message.guild_id == state.current_guild
-                                            && message.channel_id == state.current_channel
-                                        {
+                                        // Get channel
+                                        if let Some(channel) = state.get_channel_mut(message.guild_id, message.channel_id) {
                                             // Delete
-                                            let id = message.message_id;
-                                            state.messages_map.remove(&id);
+                                            channel.messages_map.remove(&id);
 
                                             // Find in list and remove
                                             let mut index = None;
-                                            for (i, &id2) in state.messages_list.iter().enumerate() {
+                                            for (i, &id2) in channel.messages_list.iter().enumerate() {
                                                 if id2 == id {
                                                     index = Some(i);
                                                     break;
                                                 }
                                             }
                                             if let Some(i) = index {
-                                                state.messages_list.remove(i);
+                                                channel.messages_list.remove(i);
                                             }
                                         }
                                     }
@@ -597,12 +677,43 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 .split(horizontal[1]);
 
             // Guild list
-            let servers = widgets::Block::default().borders(widgets::Borders::ALL);
-            f.render_widget(servers, sidebar[0]);
+            let guilds_list: Vec<_> = state
+                .guilds_list
+                .iter()
+                .filter_map(|v| state.guilds_map.get(v))
+                .map(|v| widgets::ListItem::new(Text::from(v.name.as_str())))
+                .collect();
+            let guilds = widgets::Block::default().borders(widgets::Borders::ALL);
+            let guilds = widgets::List::new(guilds_list)
+                .block(guilds)
+                .highlight_style(Style::default().bg(Color::Yellow));
+            let mut list_state = widgets::ListState::default();
+            list_state.select(state.guilds_select);
+            f.render_stateful_widget(guilds, sidebar[0], &mut list_state);
 
             // Channel list
+            let empty = vec![];
+            let channels_list: Vec<_> = state
+                .current_guild()
+                .map(|v| &v.channels_list)
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|v| {
+                    if let Some(guild) = state.current_guild() {
+                        guild.channels_map.get(v)
+                    } else {
+                        None
+                    }
+                })
+                .map(|v| widgets::ListItem::new(Text::from(v.name.as_str())))
+                .collect();
             let channels = widgets::Block::default().borders(widgets::Borders::ALL);
-            f.render_widget(channels, sidebar[1]);
+            let channels = widgets::List::new(channels_list)
+                .block(channels)
+                .highlight_style(Style::default().bg(Color::Yellow));
+            let mut list_state = widgets::ListState::default();
+            list_state.select(state.current_guild().and_then(|v| v.channels_select));
+            f.render_stateful_widget(channels, sidebar[1], &mut list_state);
 
             // Messages
             let messages = widgets::Block::default().borders(widgets::Borders::ALL);
@@ -611,48 +722,55 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             let header = Style::default()
                 .add_modifier(Modifier::BOLD);
             let messages_list: Vec<_> = state
-                .messages_list
+                .current_channel()
+                .map(|v| &v.messages_list)
+                .unwrap_or(&empty)
                 .iter()
                 .rev()
                 .filter_map(|v| {
-                        let inner = messages.inner(content[0]);
-                        let mut result = vec![];
-                    if let Some(v) = state.messages_map.get(v) {
-                        // Metadata
-                        let (author, is_bot) = state
-                            .users
-                            .get(&v.author_id)
-                            .map(|v| (v.name.as_str(), v.is_bot))
-                            .unwrap_or(("<unknown user>", true));
-                        let mut metadata = vec![Span::styled(author, header)];
+                    let inner = messages.inner(content[0]);
+                    let mut result = vec![];
 
-                        if is_bot {
-                            metadata.push(Span::styled(" [BOT]", header));
-                        }
-                        let time: DateTime<Local> =
-                            DateTime::from(UNIX_EPOCH + Duration::from_secs(v.timestamp));
-                        let format = time.format(" - %H:%M (%x)").to_string();
-                        metadata.push(Span::styled(format, header));
+                    if let Some(channel) = state.current_channel() {
+                        if let Some(v) = channel.messages_map.get(v) {
+                            // Metadata
+                            let (author, is_bot) = state
+                                .users
+                                .get(&v.author_id)
+                                .map(|v| (v.name.as_str(), v.is_bot))
+                                .unwrap_or(("<unknown user>", true));
+                            let mut metadata = vec![Span::styled(author, header)];
 
-                        if v.edited_timestamp.is_some() {
-                            metadata.push(Span::styled(" (edited)", header));
-                        }
-                        result.push(Spans::from(metadata));
-
-                        // Content
-                        match &v.content {
-                            // Text wraps
-                            MessageContent::Text(text) => {
-                                let mut i = 0;
-                                while i + (inner.width as usize) < text.len() {
-                                    result.push(Spans::from(&text[i..i + inner.width as usize]));
-                                    i += inner.width as usize;
-                                }
-                                result.push(Spans::from(&text[i..]));
+                            if is_bot {
+                                metadata.push(Span::styled(" [BOT]", header));
                             }
-                        }
+                            let time: DateTime<Local> =
+                                DateTime::from(UNIX_EPOCH + Duration::from_secs(v.timestamp));
+                            let format = time.format(" - %H:%M (%x)").to_string();
+                            metadata.push(Span::styled(format, header));
 
-                        Some(result)
+                            if v.edited_timestamp.is_some() {
+                                metadata.push(Span::styled(" (edited)", header));
+                            }
+                            result.push(Spans::from(metadata));
+
+                            // Content
+                            match &v.content {
+                                // Text wraps
+                                MessageContent::Text(text) => {
+                                    let mut i = 0;
+                                    while i + (inner.width as usize) < text.len() {
+                                        result.push(Spans::from(&text[i..i + inner.width as usize]));
+                                        i += inner.width as usize;
+                                    }
+                                    result.push(Spans::from(&text[i..]));
+                                }
+                            }
+
+                            Some(result)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -673,7 +791,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 }));
             let mut list_state = widgets::ListState::default();
             list_state.select(if matches!(state.mode, AppMode::Scroll | AppMode::Delete) || state.editing {
-                Some(state.scroll_selected)
+                state.current_channel().map(|v| v.scroll_selected)
             } else {
                 None
             });
@@ -698,6 +816,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     ])),
 
                     AppMode::Delete => widgets::Paragraph::new("are you sure you want to delete this message? (y/n)"),
+
+                    AppMode::GuildSelect => widgets::Paragraph::new("select a guild"),
                 }
             };
             f.render_widget(status, content[2]);
@@ -755,7 +875,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 }
 
                 // Scroll mode and delete mode -> don't draw cursor
-                AppMode::Scroll | AppMode::Delete => (),
+                AppMode::Scroll | AppMode::Delete | AppMode::GuildSelect => (),
             }
         })?;
 
@@ -804,6 +924,11 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             // Enter scroll mode
                             KeyCode::Char('s') => {
                                 state.write().await.mode = AppMode::Scroll;
+                            }
+
+                            // Enter guild select mode
+                            KeyCode::Char('g') => {
+                                state.write().await.mode = AppMode::GuildSelect;
                             }
 
                             // TODO: up/down
@@ -1030,11 +1155,13 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             // Scroll up
                             KeyCode::Up | KeyCode::Char('k') => {
                                 let mut state = state.write().await;
-                                if state.scroll_selected < state.messages_list.len() {
-                                    state.scroll_selected += 1;
+                                if let Some(channel) = state.current_channel_mut() {
+                                    if channel.scroll_selected < channel.messages_list.len() {
+                                        channel.scroll_selected += 1;
 
-                                    if state.scroll_selected == state.messages_list.len() {
-                                        let _ = tx.send(ClientEvent::GetMoreMessages(state.current_guild, state.current_channel, state.messages_list.first().and_then(|v| state.messages_map.get(v)).map(|v| v.id))).await;
+                                        if channel.scroll_selected >= channel.messages_list.len() {
+                                            let _ = tx.send(ClientEvent::GetMoreMessages(channel.messages_list.first().and_then(|v| channel.messages_map.get(v)).map(|v| v.id))).await;
+                                        }
                                     }
                                 }
                             }
@@ -1042,20 +1169,27 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             // Scroll down
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let mut state = state.write().await;
-                                if state.scroll_selected > 0 {
-                                    state.scroll_selected -= 1;
+                                if let Some(channel) = state.current_channel_mut() {
+                                    if channel.scroll_selected > 0 {
+                                        channel.scroll_selected -= 1;
+                                    }
                                 }
                             }
 
                             // Go to top
                             KeyCode::Char('g') => {
                                 let mut state = state.write().await;
-                                state.scroll_selected = state.messages_list.len() - 1;
+                                if let Some(channel) = state.current_channel_mut() {
+                                    channel.scroll_selected = channel.messages_list.len() - 1;
+                                }
                             }
 
                             // Go to bottom
                             KeyCode::Char('G') => {
-                                state.write().await.scroll_selected = 0;
+                                let mut state = state.write().await;
+                                if let Some(channel) = state.current_channel_mut() {
+                                    channel.scroll_selected = 0;
+                                }
                             }
 
                             // Delete message without prompt
@@ -1071,34 +1205,37 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             // Edit message
                             KeyCode::Char('e') => {
                                 let mut state = state.write().await;
+                                let current_user = state.current_user;
 
                                 // Get contents
-                                let mut temp = if let Some(message) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1).and_then(|v| state.messages_map.get(v)) {
-                                    if message.author_id == state.current_user {
-                                        #[allow(irrefutable_let_patterns)]
-                                        if let MessageContent::Text(text) = &message.content {
-                                            text.clone()
+                                if let Some(channel) = state.current_channel_mut() {
+                                    let mut temp = if let Some(message) = channel.messages_list.get(channel.messages_list.len() - channel.scroll_selected - 1).and_then(|v| channel.messages_map.get(v)) {
+                                        if message.author_id == current_user {
+                                            #[allow(irrefutable_let_patterns)]
+                                            if let MessageContent::Text(text) = &message.content {
+                                                text.clone()
+                                            } else {
+                                                continue;
+                                            }
                                         } else {
                                             continue;
                                         }
                                     } else {
                                         continue;
-                                    }
-                                } else {
-                                    continue;
-                                };
+                                    };
 
-                                // Switch mode
-                                state.mode = AppMode::TextInsert;
-                                state.editing = true;
+                                    // Switch mode
+                                    state.mode = AppMode::TextInsert;
+                                    state.editing = true;
 
-                                // Do some moving
-                                state.old_input_byte_pos = state.input_byte_pos;
-                                state.input_byte_pos = temp.bytes().len();
-                                state.old_input_char_pos = state.input_char_pos;
-                                state.input_char_pos = temp.len();
-                                std::mem::swap(&mut temp, &mut state.input);
-                                std::mem::swap(&mut temp, &mut state.old_input);
+                                    // Do some moving
+                                    state.old_input_byte_pos = state.input_byte_pos;
+                                    state.input_byte_pos = temp.bytes().len();
+                                    state.old_input_char_pos = state.input_char_pos;
+                                    state.input_char_pos = temp.len();
+                                    std::mem::swap(&mut temp, &mut state.input);
+                                    std::mem::swap(&mut temp, &mut state.old_input);
+                                }
                             }
 
                             // TODO: more controls
@@ -1117,6 +1254,58 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                         // Go back to scroll mode
                         state.write().await.mode = AppMode::Scroll;
+                    }
+
+                    AppMode::GuildSelect => {
+                        match key.code {
+                            // Exit guild select mode
+                            KeyCode::Esc => {
+                                state.write().await.mode = AppMode::TextNormal;
+                            }
+
+                            // Move down
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                let mut state = state.write().await;
+                                let guilds_count = state.guilds_list.len();
+
+                                if let Some(current_guild) = state.guilds_select.as_mut() {
+                                    if *current_guild + 1 < guilds_count {
+                                        *current_guild += 1;
+                                    }
+                                } else if !state.guilds_list.is_empty() {
+                                    state.guilds_select = Some(0);
+                                }
+                            }
+
+                            // Move up
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                let mut state = state.write().await;
+
+                                if let Some(current_guild) = state.guilds_select.as_mut() {
+                                    if *current_guild > 0 {
+                                        *current_guild -= 1;
+                                    }
+                                } else if !state.guilds_list.is_empty() {
+                                    state.guilds_select = Some(0);
+                                }
+                            }
+
+                            // Select guild
+                            KeyCode::Enter => {
+                                let mut state = state.write().await;
+                                state.current_guild = state.guilds_select.and_then(|v| state.guilds_list.get(v)).cloned();
+
+                                if let Some(guild) = state.current_guild() {
+                                    if guild.channels_list.is_empty() {
+                                        let _ = tx.send(ClientEvent::GetChannels).await;
+                                    }
+
+                                    state.mode = AppMode::TextNormal;//AppMode::ChannelSelect;
+                                }
+                            }
+
+                            _ => (),
+                        }
                     }
                 }
             }
@@ -1139,9 +1328,11 @@ async fn send_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientEve
         let mut message = String::new();
         std::mem::swap(&mut message, &mut state.input);
 
-        if let Some(&message_id) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1) {
-            if !message.is_empty() {
-                let _ = tx.send(ClientEvent::Edit(message_id, message)).await;
+        if let Some(channel) = state.current_channel() {
+            if let Some(&message_id) = channel.messages_list.get(channel.messages_list.len() - channel.scroll_selected - 1) {
+                if !message.is_empty() {
+                    let _ = tx.send(ClientEvent::Edit(message_id, message)).await;
+                }
             }
         }
 
@@ -1164,9 +1355,11 @@ async fn send_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientEve
 
 async fn delete_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientEvent>) {
     let state = state.read().await;
-    if let Some(message) = state.messages_list.get(state.messages_list.len() - state.scroll_selected - 1).and_then(|v| state.messages_map.get(v)) {
-        if message.author_id == state.current_user {
-            let _ = tx.send(ClientEvent::Delete(message.id)).await;
+    if let Some(channel) = state.current_channel() {
+        if let Some(message) = channel.messages_list.get(channel.messages_list.len() - channel.scroll_selected - 1).and_then(|v| channel.messages_map.get(v)) {
+            if message.author_id == state.current_user {
+                let _ = tx.send(ClientEvent::Delete(message.id)).await;
+            }
         }
     }
 }
