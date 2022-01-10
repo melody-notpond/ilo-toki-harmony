@@ -21,7 +21,7 @@ use harmony_rust_sdk::{
             EventSource, FormattedText, GetGuildListRequest,
             Message as RawMessage, SendMessageRequest, DeleteMessageRequest, UpdateMessageTextRequest, GetGuildRequest, GuildListEntry, GetGuildChannelsRequest, LeaveGuildRequest, JoinGuildRequest,
         },
-        profile::{GetProfileRequest, Profile},
+        profile::{GetProfileRequest, Profile, self},
     },
     client::{
         api::{
@@ -712,8 +712,24 @@ async fn receive_events(
                                 }
                             }
 
+                            chat::Event::Profile(event) => {
+                                match event {
+                                    profile::stream_event::Event::ProfileUpdated(profile) => {
+                                        let mut state = state2.write().await;
+                                        if let Some(user) = state.users.get_mut(&profile.user_id) {
+                                            if let Some(username) = profile.new_username {
+                                                user.name = username;
+                                            }
+
+                                            if let Some(is_bot) = profile.new_is_bot {
+                                                user.is_bot = is_bot;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // TODO
-                            chat::Event::Profile(_) => {}
                             chat::Event::Emote(_) => {}
                         }
                         Ok(false)
