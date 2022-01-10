@@ -18,10 +18,10 @@ use harmony_rust_sdk::{
             self,
             content::{Content, TextContent},
             get_channel_messages_request::Direction,
-            EventSource, FormattedText, GetGuildListRequest, GetGuildMembersRequest,
+            EventSource, FormattedText, GetGuildListRequest,
             Message as RawMessage, SendMessageRequest, DeleteMessageRequest, UpdateMessageTextRequest, GetGuildRequest, GuildListEntry, GetGuildChannelsRequest,
         },
-        profile::GetProfileRequest,
+        profile::{GetProfileRequest, Profile},
     },
     client::{
         api::{
@@ -65,6 +65,8 @@ enum ClientEvent {
 
     /// Gets the channels of the current guild.
     GetChannels,
+
+    GetUser(u64),
 }
 
 #[derive(Copy, Clone)]
@@ -88,8 +90,8 @@ enum AppMode {
     /// Guild select mode to select a guild.
     GuildSelect,
 
-    //// Channel select mode to select a channel.
-    //ChannelSelect,
+    /// Channel select mode to select a channel.
+    ChannelSelect,
 }
 
 impl Default for AppMode {
@@ -157,12 +159,10 @@ struct Guild {
     /// The id of the guild.
     id: u64,
 
-    /// The id of the homeserver of the guild.
-    server_id: String,
-
     /// The list of channels.
     channels_list: Vec<u64>,
 
+    /// The current channel selected.
     channels_select: Option<usize>,
 
     /// The map of channels.
@@ -283,7 +283,7 @@ async fn main() -> ClientResult<()> {
 
     // Spawn UI stuff
     tokio::spawn(tui(state.clone()));
-    tokio::spawn(ui_events(state.clone(), tx));
+    tokio::spawn(ui_events(state.clone(), tx.clone()));
 
     // Create client
     let client = Client::new(homeserver, Some(Session::new(user_id, session_id)))
@@ -313,12 +313,11 @@ async fn main() -> ClientResult<()> {
 
     {
         let mut state = state.write().await;
-        for GuildListEntry { guild_id, server_id } in guilds.guilds {
+        for GuildListEntry { guild_id, .. } in guilds.guilds {
             let guild = client.call(GetGuildRequest::new(guild_id)).await.unwrap();
             if let Some(guild) = guild.guild {
                 let guild = Guild {
                     id: guild_id,
-                    server_id,
                     channels_list: vec![],
                     channels_select: None,
                     channels_map: HashMap::new(),
@@ -333,7 +332,7 @@ async fn main() -> ClientResult<()> {
 
     // Spawn event loop
     let client = Arc::new(client);
-    tokio::spawn(receive_events(state.clone(), client.clone(), events));
+    tokio::spawn(receive_events(state.clone(), client.clone(), events, tx));
 
     // Send events
     while let Some(event) = rx.recv().await {
@@ -387,11 +386,18 @@ async fn main() -> ClientResult<()> {
 
                 // Save the messages
                 let mut state = state.write().await;
-                if let Some(channel) = state.current_channel_mut() {
+                if let Some(channel) = state.current_channel() {
+                    let guild_id = channel.guild_id;
+                    let channel_id = channel.id;
                     for message in messages.messages.into_iter().skip(1) {
-                        let id = message.message_id;
+                        let message_id = message.message_id;
                         if let Some(message) = message.message {
-                            handle_message(channel, message, id, 0);
+                            if let Some(author_id) = handle_message(&mut *state, message, guild_id, channel_id, message_id, 0) {
+                                let user = client.call(GetProfileRequest::new(author_id)).await.unwrap().profile;
+                                if let Some(profile) = user {
+                                    handle_user(&mut *state, author_id, profile);
+                                }
+                            }
                         }
                     }
                 }
@@ -437,6 +443,14 @@ async fn main() -> ClientResult<()> {
                     }
                 }
             }
+
+            ClientEvent::GetUser(user_id) => {
+                let user = client.call(GetProfileRequest::new(user_id)).await.unwrap();
+                if let Some(profile) = user.profile {
+                    let mut state = state.write().await;
+                    handle_user(&mut *state, user_id, profile);
+                }
+            }
         }
     }
 
@@ -450,42 +464,59 @@ async fn main() -> ClientResult<()> {
     std::process::exit(0);
 }
 
-fn handle_message(channel: &mut Channel, message: RawMessage, id: u64, index: usize) {
+/// Handles a message, returning the author id if the author is unknown.
+fn handle_message(state: &mut AppState, message: RawMessage, guild_id: u64, channel_id: u64, message_id: u64, index: usize) -> Option<u64> {
     // Get content
-    if let Some(content) = message.content {
-        if let Some(content) = content.content {
-            match content {
-                // Text message
-                Content::TextMessage(text) => {
-                    if let Some(text) = text.content {
-                        let message = Message {
-                            id,
-                            author_id: message.author_id,
-                            content: MessageContent::Text(text.text),
-                            timestamp: message.created_at,
-                            edited_timestamp: message.edited_at,
-                        };
+    let author_id = message.author_id;
+    if let Some(channel) = state.get_channel_mut(guild_id, channel_id) {
+        if let Some(content) = message.content {
+            if let Some(content) = content.content {
+                match content {
+                    // Text message
+                    Content::TextMessage(text) => {
+                        if let Some(text) = text.content {
+                            let message = Message {
+                                id: message_id,
+                                author_id,
+                                content: MessageContent::Text(text.text),
+                                timestamp: message.created_at,
+                                edited_timestamp: message.edited_at,
+                            };
 
-                        if index >= channel.messages_list.len() {
-                            channel.messages_list.push(id);
-                        } else {
-                            channel.messages_list.insert(index, id);
+                            if index >= channel.messages_list.len() {
+                                channel.messages_list.push(message_id);
+                            } else {
+                                channel.messages_list.insert(index, message_id);
+                            }
+
+                            channel.messages_map.insert(message_id, message);
                         }
-
-                        channel.messages_map.insert(id, message);
                     }
-                }
 
-                // TODO
-                Content::EmbedMessage(_) => {}
-                Content::AttachmentMessage(_) => {}
-                Content::PhotoMessage(_) => {}
-                Content::InviteRejected(_) => {}
-                Content::InviteAccepted(_) => {}
-                Content::RoomUpgradedToGuild(_) => {}
+                    // TODO
+                    Content::EmbedMessage(_) => {}
+                    Content::AttachmentMessage(_) => {}
+                    Content::PhotoMessage(_) => {}
+                    Content::InviteRejected(_) => {}
+                    Content::InviteAccepted(_) => {}
+                    Content::RoomUpgradedToGuild(_) => {}
+                }
             }
         }
     }
+
+    if !state.users.contains_key(&author_id) {
+        Some(author_id)
+    } else {
+        None
+    }
+}
+
+fn handle_user(state: &mut AppState, user_id: u64, user: Profile) {
+    state.users.insert(user_id, Member {
+        name: user.user_name,
+        is_bot: user.is_bot,
+    });
 }
 
 /// Event loop to process incoming events.
@@ -493,12 +524,14 @@ async fn receive_events(
     state: Arc<RwLock<AppState>>,
     client: Arc<Client>,
     events: Vec<EventSource>,
+    tx: mpsc::Sender<ClientEvent>,
 ) {
     client
         .event_loop(events, {
             move |_client, event| {
                 // This has to be done for ownership reasons
                 let state2 = state.clone();
+                let tx = tx.clone();
 
                 async move {
                     // Stop if not running
@@ -519,10 +552,13 @@ async fn receive_events(
                                         let mut state = state2.write().await;
 
                                         // Get message
-                                        let id = message.message_id;
-                                        if let Some(channel) = state.get_channel_mut(message.guild_id, message.channel_id) {
-                                            if let Some(message) = message.message {
-                                                handle_message(channel, message, id, usize::MAX);
+                                        let guild_id = message.guild_id;
+                                        let channel_id = message.channel_id;
+                                        let message_id = message.message_id;
+                                        if let Some(message) = message.message {
+                                            if let Some(author_id) = handle_message(&mut *state, message, guild_id, channel_id, message_id, usize::MAX) {
+                                                drop(state);
+                                                let _ = tx.send(ClientEvent::GetUser(author_id)).await;
                                             }
                                         }
                                     }
@@ -818,6 +854,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     AppMode::Delete => widgets::Paragraph::new("are you sure you want to delete this message? (y/n)"),
 
                     AppMode::GuildSelect => widgets::Paragraph::new("select a guild"),
+
+                    AppMode::ChannelSelect => widgets::Paragraph::new("select a channel"),
                 }
             };
             f.render_widget(status, content[2]);
@@ -875,7 +913,7 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                 }
 
                 // Scroll mode and delete mode -> don't draw cursor
-                AppMode::Scroll | AppMode::Delete | AppMode::GuildSelect => (),
+                AppMode::Scroll | AppMode::Delete | AppMode::GuildSelect | AppMode::ChannelSelect => (),
             }
         })?;
 
@@ -929,6 +967,11 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             // Enter guild select mode
                             KeyCode::Char('g') => {
                                 state.write().await.mode = AppMode::GuildSelect;
+                            }
+
+                            // Enter channel select mode
+                            KeyCode::Char('c') => {
+                                state.write().await.mode = AppMode::ChannelSelect;
                             }
 
                             // TODO: up/down
@@ -1300,8 +1343,66 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                         let _ = tx.send(ClientEvent::GetChannels).await;
                                     }
 
-                                    state.mode = AppMode::TextNormal;//AppMode::ChannelSelect;
+                                    state.mode = AppMode::ChannelSelect;
                                 }
+                            }
+
+                            _ => (),
+                        }
+                    }
+
+                    AppMode::ChannelSelect => {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.write().await.mode = AppMode::TextNormal;
+                            }
+
+                            // Move down
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                let mut state = state.write().await;
+
+                                if let Some(guild) = state.current_guild_mut() {
+                                    let channel_count = guild.channels_list.len();
+                                    if let Some(current_channel) = guild.channels_select.as_mut() {
+                                        if *current_channel + 1 < channel_count {
+                                            *current_channel += 1;
+                                        }
+                                    } else if !guild.channels_list.is_empty() {
+                                        guild.channels_select = Some(0);
+                                    }
+                                }
+                            }
+
+                            // Move up
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                let mut state = state.write().await;
+
+                                if let Some(guild) = state.current_guild_mut() {
+                                    if let Some(current_channel) = guild.channels_select.as_mut() {
+                                        if *current_channel > 0 {
+                                            *current_channel -= 1;
+                                        }
+                                    } else if !guild.channels_list.is_empty() {
+                                        guild.channels_select = Some(0);
+                                    }
+                                }
+                            }
+
+                            // Select channel
+                            KeyCode::Enter => {
+                                let mut state = state.write().await;
+                                if let Some(guild) = state.current_guild_mut() {
+                                    guild.current_channel = guild.channels_select.and_then(|v| guild.channels_list.get(v)).cloned();
+
+                                    if let Some(channel) = guild.current_channel() {
+                                        if channel.messages_list.is_empty() {
+                                            let _ = tx.send(ClientEvent::GetMoreMessages(None)).await;
+                                        }
+
+                                        state.mode = AppMode::TextNormal;
+                                    }
+                                }
+
                             }
 
                             _ => (),

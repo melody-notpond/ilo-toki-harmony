@@ -16,9 +16,6 @@ Scroll mode lets you scroll through messages using your arrow keys. It also lets
 
 
 ## TODO
- - Editing messages
- - Deleting messages
- - Guild and channel navigation and usage
  - Markdown
  - Attachments
  - Embeds as links
