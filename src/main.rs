@@ -100,8 +100,8 @@ enum AppMode {
     /// Channel select mode to select a channel.
     ChannelSelect,
 
-    //// Guild leave mode to leave a guild.
-    //GuildLeave,
+    /// Guild leave mode to leave a guild.
+    GuildLeave,
 }
 
 impl Default for AppMode {
@@ -794,7 +794,11 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
             let guilds = widgets::Block::default().borders(widgets::Borders::ALL);
             let guilds = widgets::List::new(guilds_list)
                 .block(guilds)
-                .highlight_style(Style::default().bg(Color::Yellow));
+                .highlight_style(Style::default().bg(if matches!(state.mode, AppMode::GuildLeave) {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                }));
             let mut list_state = widgets::ListState::default();
             list_state.select(state.guilds_select);
             f.render_stateful_widget(guilds, sidebar[0], &mut list_state);
@@ -943,6 +947,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     AppMode::GuildSelect => widgets::Paragraph::new("select a guild"),
 
                     AppMode::ChannelSelect => widgets::Paragraph::new("select a channel"),
+
+                    AppMode::GuildLeave => widgets::Paragraph::new("are you sure you want to leave this guild? (y/n)"),
                 }
             };
             f.render_widget(status, content[2]);
@@ -999,8 +1005,8 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                     );
                 }
 
-                // Scroll mode and delete mode -> don't draw cursor
-                AppMode::Scroll | AppMode::Delete | AppMode::GuildSelect | AppMode::ChannelSelect => (),
+                // Everything else -> don't draw cursor
+                _ => (),
             }
         })?;
 
@@ -1437,12 +1443,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             }
 
                             KeyCode::Char('l') => {
-                                let state = state.read().await;
-                                let selected_guild = state.guilds_select.and_then(|v| state.guilds_list.get(v)).cloned();
-
-                                if let Some(guild_id) = selected_guild {
-                                    let _ = tx.send(ClientEvent::LeaveGuild(guild_id)).await;
-                                }
+                                state.write().await.mode = AppMode::GuildLeave;
                             }
 
                             _ => (),
@@ -1505,6 +1506,21 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
 
                             _ => (),
                         }
+                    }
+
+                    AppMode::GuildLeave => {
+                        // Leave if user chose to leave
+                        if let KeyCode::Char('y') = key.code {
+                            let state = state.read().await;
+                            let selected_guild = state.guilds_select.and_then(|v| state.guilds_list.get(v)).cloned();
+
+                            if let Some(guild_id) = selected_guild {
+                                let _ = tx.send(ClientEvent::LeaveGuild(guild_id)).await;
+                            }
+                        }
+
+                        // Go back to guild select mode
+                        state.write().await.mode = AppMode::GuildSelect;
                     }
                 }
             }
