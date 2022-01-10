@@ -114,6 +114,9 @@ struct Message {
     /// The user id of the author.
     author_id: u64,
 
+    /// If an override is present, sets the username to this string.
+    override_username: Option<String>,
+
     /// The content of the message.
     content: MessageContent,
 
@@ -468,6 +471,7 @@ async fn main() -> ClientResult<()> {
 fn handle_message(state: &mut AppState, message: RawMessage, guild_id: u64, channel_id: u64, message_id: u64, index: usize) -> Option<u64> {
     // Get content
     let author_id = message.author_id;
+
     if let Some(channel) = state.get_channel_mut(guild_id, channel_id) {
         if let Some(content) = message.content {
             if let Some(content) = content.content {
@@ -478,6 +482,7 @@ fn handle_message(state: &mut AppState, message: RawMessage, guild_id: u64, chan
                             let message = Message {
                                 id: message_id,
                                 author_id,
+                                override_username: message.overrides.and_then(|v| v.username),
                                 content: MessageContent::Text(text.text),
                                 timestamp: message.created_at,
                                 edited_timestamp: message.edited_at,
@@ -775,7 +780,13 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                                 .get(&v.author_id)
                                 .map(|v| (v.name.as_str(), v.is_bot))
                                 .unwrap_or(("<unknown user>", true));
-                            let mut metadata = vec![Span::styled(author, header)];
+                            let mut metadata = vec![];
+                            if let Some(override_username) = &v.override_username {
+                                metadata.push(Span::styled(override_username.as_str(), header));
+                                metadata.push(Span::styled(" [OVR]", header));
+                            } else {
+                                metadata.push(Span::styled(author, header));
+                            }
 
                             if is_bot {
                                 metadata.push(Span::styled(" [BOT]", header));
@@ -1450,7 +1461,9 @@ async fn send_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientEve
         state.input_byte_pos = 0;
         state.input_char_pos = 0;
 
-        let _ = tx.send(ClientEvent::Send(message)).await;
+        if !message.is_empty() {
+            let _ = tx.send(ClientEvent::Send(message)).await;
+        }
     }
 }
 

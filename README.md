@@ -28,6 +28,7 @@ Scroll mode lets you scroll through messages using your arrow keys. It also lets
  - Theming
  - Mouse support
  - `:tutorial` command for new users
+ - PluralKit-like functionality
 
 Things that aren't important but would be neat:
  - Pictures in terminal for terminals that support it
