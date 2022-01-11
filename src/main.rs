@@ -13,7 +13,7 @@ use crossterm::{event::{KeyCode, KeyModifiers}, execute};
 
 use harmony_rust_sdk::{
     api::{
-        auth::Session,
+        auth::{Session, auth_step::Step, next_step_request::form_fields::Field},
         chat::{
             self,
             content::{Content, TextContent},
@@ -26,7 +26,7 @@ use harmony_rust_sdk::{
     client::{
         api::{
             chat::channel::GetChannelMessages,
-            profile::{UpdateProfile, UserStatus},
+            profile::{UpdateProfile, UserStatus}, auth::AuthStepResponse,
         },
         error::ClientResult,
         Client,
@@ -270,9 +270,11 @@ impl AppState {
         self.current_guild_mut().and_then(Guild::current_channel_mut)
     }
 
+    /*
     fn get_channel(&self, guild_id: u64, channel_id: u64) -> Option<&Channel> {
         self.guilds_map.get(&guild_id).and_then(|v| v.channels_map.get(&channel_id))
     }
+    */
 
     fn get_channel_mut(&mut self, guild_id: u64, channel_id: u64) -> Option<&mut Channel> {
         self.guilds_map.get_mut(&guild_id).and_then(|v| v.channels_map.get_mut(&channel_id))
@@ -283,25 +285,34 @@ impl AppState {
 async fn main() -> ClientResult<()> {
     // Get auth data from .env file
     dotenv::dotenv().unwrap();
-    let session_id = env::var("session_id").unwrap();
-    let user_id = env::var("user_id").unwrap().parse().unwrap();
     let homeserver = env::var("homeserver").unwrap().parse().unwrap();
 
     // Set up the state
     let state = Arc::new(RwLock::new(AppState::default()));
-    state.write().await.current_user = user_id;
 
     // Create a mpsc channel
     let (tx, mut rx) = mpsc::channel(128);
 
+    // Create client
+    let client = Client::new(homeserver, None)
+        .await
+        .unwrap();
+
+    auth(&client).await;
+
+    if !RUNNING.load(Ordering::Acquire) {
+        let stdout = std::io::stdout();
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.clear().unwrap();
+        crossterm::terminal::disable_raw_mode().unwrap();
+        terminal.set_cursor(0, 0).unwrap();
+        return Ok(());
+    }
+
     // Spawn UI stuff
     tokio::spawn(tui(state.clone()));
     tokio::spawn(ui_events(state.clone(), tx.clone()));
-
-    // Create client
-    let client = Client::new(homeserver, Some(Session::new(user_id, session_id)))
-        .await
-        .unwrap();
 
     // Change our status to online
     client
@@ -500,6 +511,446 @@ async fn main() -> ClientResult<()> {
 
     // Die! :D
     std::process::exit(0);
+}
+
+enum AuthFormFieldType {
+    Text,
+    Email,
+    Number,
+    Password,
+    NewPassword,
+}
+
+enum AuthInput {
+    Initial,
+
+    Choice {
+        choices: Vec<String>,
+        current_choice: Option<usize>,
+    },
+
+    Form {
+        fields: Vec<(String, AuthFormFieldType, String, Option<String>)>,
+        selected: Option<usize>,
+        selected_second: bool,
+        editing: bool,
+    },
+
+    Waiting(String),
+}
+
+impl Default for AuthInput {
+    fn default() -> Self {
+        Self::Initial
+    }
+}
+
+#[derive(Default)]
+struct AuthState {
+    can_go_back: bool,
+    title: String,
+    input: AuthInput,
+}
+
+async fn auth(client: &Client) {
+    client.begin_auth().await.unwrap();
+    let state = Arc::new(RwLock::new(AuthState::default()));
+
+    let (tx, mut rx) = mpsc::channel(128);
+    let tui = tokio::spawn(auth_tui(state.clone()));
+    let ui_events = tokio::spawn(auth_ui_events(state.clone(), tx));
+
+    let mut step = client.next_auth_step(AuthStepResponse::Initial).await.unwrap_or(None).and_then(|v| v.step);
+    'a: while RUNNING.load(Ordering::Acquire) {
+        if let Some(step) = step {
+            let can_go_back = step.can_go_back;
+            if let Some(step) = step.step { // why are there so many nested optionals
+                let mut state = state.write().await;
+                state.can_go_back = can_go_back;
+
+                match step {
+                    Step::Choice(mut choice) => {
+                        for choice in choice.options.iter_mut() {
+                            *choice = choice.replace('-', " ");
+                        }
+
+                        state.title = choice.title.replace('-', " ");
+
+                        state.input = AuthInput::Choice {
+                            choices: choice.options,
+                            current_choice: None,
+                        };
+                    }
+
+                    Step::Form(form) => {
+                        state.title = form.title.replace('-', " ");
+                        let fields = form.fields.iter().map(|v| (v.name.replace('-', " "), match v.r#type.as_str() {
+                            "password" => AuthFormFieldType::Password,
+                            "new-password" => AuthFormFieldType::NewPassword,
+                            "email" => AuthFormFieldType::Email,
+                            "number" => AuthFormFieldType::Number,
+                            _ => AuthFormFieldType::Text,
+                        }, String::new(), if v.r#type == "new-password" {
+                            Some(String::new())
+                        } else {
+                            None
+                        })).collect();
+
+                        state.input = AuthInput::Form {
+                            fields,
+                            selected: None,
+                            selected_second: false,
+                            editing: false,
+                        };
+                    }
+
+                    // I don't think this is reachable
+                    Step::Session(_) => (),
+
+                    Step::Waiting(wait) => {
+                        state.input = AuthInput::Waiting(wait.description);
+                    }
+                }
+            }
+        }
+
+        loop {
+            let request = match rx.recv().await {
+                Some(v) => v,
+                None => break 'a,
+            };
+            if matches!(request, AuthStepResponse::Initial) {
+                let response = client.prev_auth_step().await;
+                if let Ok(back) = response {
+                    step = back.step;
+                    break;
+                }
+            } else {
+                let response = client.next_auth_step(request).await;
+                match response {
+                    Ok(Some(forwards)) => {
+                        step = forwards.step;
+                        break;
+                    }
+
+                    Ok(None) => break 'a,
+                    Err(_) => (),
+                }
+            }
+        }
+    }
+
+    tui.abort();
+    ui_events.abort();
+}
+
+async fn auth_tui(state: Arc<RwLock<AuthState>>) -> Result<(), std::io::Error> {
+    // Set up
+    let stdout = std::io::stdout();
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    crossterm::terminal::enable_raw_mode()?;
+    terminal.clear()?;
+
+    while RUNNING.load(Ordering::Acquire) {
+        let state = state.read().await;
+
+        terminal.draw(|f| {
+            let size = f.size();
+            let vertical = layout::Layout::default()
+                .direction(layout::Direction::Vertical)
+                .constraints([
+                    layout::Constraint::Min(1),
+                    layout::Constraint::Length(1),
+                ]).split(size);
+
+            let block = widgets::Block::default()
+                .borders(widgets::Borders::ALL)
+                .title(state.title.as_str());
+
+            match &state.input {
+                AuthInput::Initial => (),
+
+                AuthInput::Choice { choices, current_choice } => {
+                    let list: Vec<_> = choices.iter().map(|v| widgets::ListItem::new(v.as_str())).collect();
+                    let list = widgets::List::new(list)
+                        .block(block)
+                        .highlight_style(Style::default().bg(Color::Yellow));
+                    let mut list_state = widgets::ListState::default();
+                    list_state.select(*current_choice);
+                    f.render_stateful_widget(list, vertical[0], &mut list_state);
+                }
+
+                AuthInput::Form { fields, selected, selected_second, editing }=> {
+                    let layout_vec: Vec<_> = fields
+                        .iter()
+                        .map(|v| if let AuthFormFieldType::NewPassword = v.1 {
+                            layout::Constraint::Length(7)
+                        } else {
+                            layout::Constraint::Length(4)
+                        })
+                        .collect();
+                    let fields_layout = layout::Layout::default()
+                        .direction(layout::Direction::Vertical)
+                        .constraints(layout_vec)
+                        .split(block.inner(vertical[0]));
+                    f.render_widget(block, vertical[0]);
+
+                    for (i, ((name, type_, input, input2), rect)) in fields.iter().zip(fields_layout.into_iter()).enumerate() {
+                        let partial = layout::Layout::default()
+                            .direction(layout::Direction::Vertical)
+                            .constraints([
+                                layout::Constraint::Length(1),
+                                layout::Constraint::Length(3),
+                                layout::Constraint::Length(3),
+                            ])
+                            .split(rect);
+
+                        let label = widgets::Paragraph::new(Span::styled(name.as_str(), Style::default().add_modifier(Modifier::BOLD)));
+                        f.render_widget(label, partial[0]);
+
+                        let input_box = widgets::Block::default()
+                            .borders(widgets::Borders::ALL)
+                            .style(if matches!(*selected, Some(j) if j == i) && !selected_second {
+                                Style::default().bg(Color::Yellow)
+                            } else {
+                                Style::default()
+                            });
+                        let input_box = if let AuthFormFieldType::Password | AuthFormFieldType::NewPassword = type_ {
+                            widgets::Paragraph::new("*".repeat(input.len()))
+                        } else {
+                            widgets::Paragraph::new(input.as_str())
+                        }.block(input_box);
+                        f.render_widget(input_box, partial[1]);
+
+                        if let Some(input) = input2 {
+                            let input_box = widgets::Block::default()
+                                .borders(widgets::Borders::ALL)
+                                .style(if matches!(*selected, Some(j) if j == i) && *selected_second {
+                                    Style::default().bg(Color::Yellow)
+                                } else {
+                                    Style::default()
+                                });
+                            let input_box = widgets::Paragraph::new("*".repeat(input.len()))
+                                .block(input_box);
+                            f.render_widget(input_box, partial[2]);
+                        }
+                    }
+                }
+
+                // TODO
+                AuthInput::Waiting(_) => {}
+            }
+
+            let status = if state.can_go_back {
+                widgets::Paragraph::new("press right arrow to go back, q to quit")
+            } else {
+                widgets::Paragraph::new("press q to quit")
+            };
+            f.render_widget(status, vertical[1]);
+        }).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    Ok(())
+}
+
+async fn auth_ui_events(state: Arc<RwLock<AuthState>>, tx: mpsc::Sender<AuthStepResponse>) {
+    while let Ok(event) = tokio::task::spawn_blocking(crossterm::event::read).await.unwrap() {
+        match event {
+            crossterm::event::Event::Key(key) => {
+                let mut state = state.write().await;
+                let can_go_back = state.can_go_back;
+
+                match &mut state.input {
+                    AuthInput::Initial => {
+                        match key.code {
+                            KeyCode::Char('h') | KeyCode::Right if can_go_back => {
+                                let _ = tx.send(AuthStepResponse::Initial).await;
+                            }
+
+                            KeyCode::Char('q') => {
+                                RUNNING.store(false, Ordering::Release);
+                                break;
+                            }
+
+                            _ => (),
+                        }
+                    }
+
+                    AuthInput::Choice { choices, current_choice } => {
+                        match key.code {
+                            KeyCode::Char('h') | KeyCode::Right if can_go_back => {
+                                let _ = tx.send(AuthStepResponse::Initial).await;
+                            }
+
+                            KeyCode::Char('q') => {
+                                RUNNING.store(false, Ordering::Release);
+                                break;
+                            }
+
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if let Some(choice) = current_choice.as_mut() {
+                                    if *choice + 1 < choices.len() {
+                                        *choice += 1;
+                                    }
+                                } else {
+                                    *current_choice = Some(0);
+                                }
+                            }
+
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                if let Some(choice) = current_choice.as_mut() {
+                                    if *choice > 0 {
+                                        *choice -= 1;
+                                    }
+                                } else {
+                                    *current_choice = Some(choices.len() - 1);
+                                }
+                            }
+
+                            KeyCode::Enter => {
+                                if let Some(choice) = current_choice {
+                                    let _ = tx.send(AuthStepResponse::Choice(choices.get(*choice).unwrap().replace(' ', "-"))).await;
+                                }
+                            }
+
+                            _ => (),
+                        }
+                    }
+
+                    AuthInput::Form { fields, selected, selected_second, editing } => {
+                        match key.code {
+                            KeyCode::Char('h') | KeyCode::Right if can_go_back && !*editing => {
+                                let _ = tx.send(AuthStepResponse::Initial).await;
+                            }
+
+                            KeyCode::Char('q') if !*editing => {
+                                RUNNING.store(false, Ordering::Release);
+                                break;
+                            }
+
+                            KeyCode::Esc => {
+                                *editing = false;
+                            }
+
+                            KeyCode::Char('i') if !*editing => {
+                                *editing = true;
+                            }
+
+                            KeyCode::Char('j') | KeyCode::Down if !*editing => {
+                                if let Some(selection) = selected.as_mut() {
+                                    if *selection + 1 < fields.len() {
+                                        *selection += 1;
+                                    }
+                                } else {
+                                    *selected = Some(0);
+                                }
+                            }
+
+                            KeyCode::Char('k') | KeyCode::Up if !*editing => {
+                                if let Some(selection) = selected.as_mut() {
+                                    if *selection > 0 {
+                                        *selection -= 1;
+                                    }
+                                } else {
+                                    *selected = Some(fields.len() - 1);
+                                }
+                            }
+
+                            KeyCode::Tab if !*editing => {
+                                *selected_second ^= true;
+                            }
+
+                            KeyCode::Char(c) if *editing => {
+                                if let Some((_, _, input, input2)) = selected.and_then(|v| fields.get_mut(v)) {
+                                    let input = if *selected_second {
+                                        input2.as_mut().unwrap()
+                                    } else {
+                                        input
+                                    };
+                                    input.push(c);
+                                }
+                            }
+
+                            KeyCode::Backspace if *editing => {
+                                if let Some((_, _, input, input2)) = selected.and_then(|v| fields.get_mut(v)) {
+                                    let input = if *selected_second {
+                                        input2.as_mut().unwrap()
+                                    } else {
+                                        input
+                                    };
+                                    input.pop();
+                                }
+                            }
+
+                            // TODO: arrow keys and vim controls (or maybe not; after all, this is
+                            // just login stuff)
+
+                            KeyCode::Enter => {
+                                if !fields.iter().any(|v| v.2.is_empty() || v.3.as_ref().map(|v| v.is_empty()).unwrap_or(false)) {
+                                    let mut result = vec![];
+                                    for (_, type_, input, input2) in fields.iter() {
+                                        match type_ {
+                                            AuthFormFieldType::Text => {
+                                                result.push(Field::String(input.clone()));
+                                            }
+
+                                            AuthFormFieldType::Email => {
+                                                // TODO: verification
+                                                result.push(Field::String(input.clone()));
+                                            }
+
+                                            AuthFormFieldType::Number => {
+                                                // TODO: what if this is an error?
+                                                result.push(Field::Number(input.parse().unwrap()));
+                                            }
+
+                                            AuthFormFieldType::Password => {
+                                                result.push(Field::Bytes(input.bytes().collect()));
+                                            }
+
+                                            AuthFormFieldType::NewPassword => {
+                                                // TODO: what if they aren't the same?
+                                                assert_eq!(input, input2.as_ref().unwrap());
+                                                result.push(Field::Bytes(input.bytes().collect()));
+                                            }
+                                        }
+                                    }
+
+                                    let _ = tx.send(AuthStepResponse::Form(result)).await;
+                                }
+                            }
+
+                            _ => (),
+                        }
+                    }
+
+                    AuthInput::Waiting(_) => {
+                        match key.code {
+                            KeyCode::Char('h') | KeyCode::Right if can_go_back => {
+                                let _ = tx.send(AuthStepResponse::Initial).await;
+                            }
+
+                            KeyCode::Char('q') => {
+                                RUNNING.store(false, Ordering::Release);
+                                break;
+                            }
+
+                            _ => (),
+                        }
+                    }
+                }
+            }
+
+            // TODO
+            crossterm::event::Event::Mouse(_) => {
+            }
+
+            crossterm::event::Event::Resize(_, _) => (),
+        }
+    }
 }
 
 /// Handles a message, returning the author id if the author is unknown.
@@ -1434,13 +1885,14 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                             // Move up
                             KeyCode::Char('k') | KeyCode::Up => {
                                 let mut state = state.write().await;
+                                let guilds_count = state.guilds_list.len();
 
                                 if let Some(current_guild) = state.guilds_select.as_mut() {
                                     if *current_guild > 0 {
                                         *current_guild -= 1;
                                     }
                                 } else if !state.guilds_list.is_empty() {
-                                    state.guilds_select = Some(0);
+                                    state.guilds_select = Some(guilds_count - 1);
                                 }
                             }
 
@@ -1493,12 +1945,14 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                 let mut state = state.write().await;
 
                                 if let Some(guild) = state.current_guild_mut() {
+                                    let channel_count = guild.channels_list.len();
+
                                     if let Some(current_channel) = guild.channels_select.as_mut() {
                                         if *current_channel > 0 {
                                             *current_channel -= 1;
                                         }
                                     } else if !guild.channels_list.is_empty() {
-                                        guild.channels_select = Some(0);
+                                        guild.channels_select = Some(channel_count - 1);
                                     }
                                 }
                             }
