@@ -284,8 +284,7 @@ impl AppState {
 #[tokio::main]
 async fn main() -> ClientResult<()> {
     // Get auth data from .env file
-    dotenv::dotenv().unwrap();
-    let homeserver = env::var("homeserver").unwrap().parse().unwrap();
+    let homeserver = "https://chat.harmonyapp.io:2289".parse().unwrap();
 
     // Set up the state
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -325,7 +324,8 @@ async fn main() -> ClientResult<()> {
         .unwrap();
 
     // Our account's user id
-    //let self_id = client.auth_status().session().unwrap().user_id;
+    let self_id = client.auth_status().session().unwrap().user_id;
+    state.write().await.current_user = self_id;
 
     // Event filters
     let guilds = client.call(GetGuildListRequest::default()).await.unwrap();
