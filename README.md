@@ -19,6 +19,7 @@ Guild selection mode lets you select a guild to interact with. Use your arrow ke
 Channel selection mode is like guild selection mode but for channels instead of guilds. This mode is accessible either via guild selection mode by pressing enter or via normal mode by pressing <key>c</key>.
 
 ## TODO
+ - Copy paste support
  - Markdown
  - Attachments
  - Embeds as links

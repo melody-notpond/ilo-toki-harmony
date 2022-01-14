@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -283,30 +282,46 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> ClientResult<()> {
-    // Get auth data from .env file
-    let homeserver = "https://chat.harmonyapp.io:2289".parse().unwrap();
-
     // Set up the state
     let state = Arc::new(RwLock::new(AppState::default()));
 
     // Create a mpsc channel
     let (tx, mut rx) = mpsc::channel(128);
 
-    // Create client
-    let client = Client::new(homeserver, None)
-        .await
-        .unwrap();
+    // Get auth data
+    let homeserver_default = "https://chat.harmonyapp.io:2289";
+    let auth_data = dirs::data_dir().and_then(|v| std::fs::read_to_string(v.join("ilo-toki/auth")).ok());
 
-    auth(&client).await;
+    // Create client
+    let client = if let Some(auth_data) = auth_data {
+        let mut split = auth_data.split('\n');
+        let homeserver = split.next().unwrap_or(homeserver_default);
+        let token = split.next();
+        let user_id = split.next().and_then(|v| v.parse().ok());
+        let session = match (token, user_id) {
+            (Some(token), Some(user_id)) => Some(Session::new(user_id, String::from(token))),
+            _ => None,
+        };
+        Client::new(homeserver.parse().unwrap_or_else(|_| homeserver_default.parse().unwrap()), session)
+            .await
+            .unwrap()
+    } else {
+        Client::new(homeserver_default.parse().unwrap(), None)
+            .await
+            .unwrap()
+    };
+    if !client.auth_status().is_authenticated() {
+        auth(&client).await;
+    }
 
     if !RUNNING.load(Ordering::Acquire) {
-        let stdout = std::io::stdout();
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.clear().unwrap();
-        crossterm::terminal::disable_raw_mode().unwrap();
-        terminal.set_cursor(0, 0).unwrap();
+        clear();
         return Ok(());
+    } else if let Some(auth_path) = dirs::data_dir() {
+        std::fs::create_dir(auth_path.join("ilo-toki/")).ok();
+        let auth_status = client.auth_status();
+        let auth = auth_status.session().unwrap();
+        std::fs::write(auth_path.join("ilo-toki/auth"), format!("{}\n{}\n{}\n", client.homeserver_url(), auth.session_token, auth.user_id)).unwrap();
     }
 
     // Spawn UI stuff
@@ -510,6 +525,7 @@ async fn main() -> ClientResult<()> {
         .unwrap();
 
     // Die! :D
+    clear();
     std::process::exit(0);
 }
 
@@ -790,7 +806,7 @@ async fn auth_ui_events(state: Arc<RwLock<AuthState>>, tx: mpsc::Sender<AuthStep
                                 break;
                             }
 
-                            KeyCode::Char('j') | KeyCode::Down => {
+                            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
                                 if let Some(choice) = current_choice.as_mut() {
                                     if *choice + 1 < choices.len() {
                                         *choice += 1;
@@ -800,7 +816,7 @@ async fn auth_ui_events(state: Arc<RwLock<AuthState>>, tx: mpsc::Sender<AuthStep
                                 }
                             }
 
-                            KeyCode::Char('k') | KeyCode::Up => {
+                            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
                                 if let Some(choice) = current_choice.as_mut() {
                                     if *choice > 0 {
                                         *choice -= 1;
@@ -835,7 +851,27 @@ async fn auth_ui_events(state: Arc<RwLock<AuthState>>, tx: mpsc::Sender<AuthStep
                                 *editing = false;
                             }
 
-                            KeyCode::Char('i') if !*editing => {
+                            KeyCode::Tab => {
+                                if let Some(selection) = selected.as_mut() {
+                                    if *selection + 1 < fields.len() {
+                                        *selection += 1;
+                                    }
+                                } else {
+                                    *selected = Some(0);
+                                }
+                            }
+
+                            KeyCode::BackTab => {
+                                if let Some(selection) = selected.as_mut() {
+                                    if *selection > 0 {
+                                        *selection -= 1;
+                                    }
+                                } else {
+                                    *selected = Some(fields.len() - 1);
+                                }
+                            }
+
+                            KeyCode::Char('i') if !*editing && selected.is_some() => {
                                 *editing = true;
                             }
 
@@ -857,10 +893,6 @@ async fn auth_ui_events(state: Arc<RwLock<AuthState>>, tx: mpsc::Sender<AuthStep
                                 } else {
                                     *selected = Some(fields.len() - 1);
                                 }
-                            }
-
-                            KeyCode::Tab if !*editing => {
-                                *selected_second ^= true;
                             }
 
                             KeyCode::Char(c) if *editing => {
@@ -889,38 +921,36 @@ async fn auth_ui_events(state: Arc<RwLock<AuthState>>, tx: mpsc::Sender<AuthStep
                             // just login stuff)
 
                             KeyCode::Enter => {
-                                if !fields.iter().any(|v| v.2.is_empty() || v.3.as_ref().map(|v| v.is_empty()).unwrap_or(false)) {
-                                    let mut result = vec![];
-                                    for (_, type_, input, input2) in fields.iter() {
-                                        match type_ {
-                                            AuthFormFieldType::Text => {
-                                                result.push(Field::String(input.clone()));
-                                            }
+                                let mut result = vec![];
+                                for (_, type_, input, input2) in fields.iter() {
+                                    match type_ {
+                                        AuthFormFieldType::Text => {
+                                            result.push(Field::String(input.clone()));
+                                        }
 
-                                            AuthFormFieldType::Email => {
-                                                // TODO: verification
-                                                result.push(Field::String(input.clone()));
-                                            }
+                                        AuthFormFieldType::Email => {
+                                            // TODO: verification
+                                            result.push(Field::String(input.clone()));
+                                        }
 
-                                            AuthFormFieldType::Number => {
-                                                // TODO: what if this is an error?
-                                                result.push(Field::Number(input.parse().unwrap()));
-                                            }
+                                        AuthFormFieldType::Number => {
+                                            // TODO: what if this is an error?
+                                            result.push(Field::Number(input.parse().unwrap()));
+                                        }
 
-                                            AuthFormFieldType::Password => {
-                                                result.push(Field::Bytes(input.bytes().collect()));
-                                            }
+                                        AuthFormFieldType::Password => {
+                                            result.push(Field::Bytes(input.bytes().collect()));
+                                        }
 
-                                            AuthFormFieldType::NewPassword => {
-                                                // TODO: what if they aren't the same?
-                                                assert_eq!(input, input2.as_ref().unwrap());
-                                                result.push(Field::Bytes(input.bytes().collect()));
-                                            }
+                                        AuthFormFieldType::NewPassword => {
+                                            // TODO: what if they aren't the same?
+                                            assert_eq!(input, input2.as_ref().unwrap());
+                                            result.push(Field::Bytes(input.bytes().collect()));
                                         }
                                     }
-
-                                    let _ = tx.send(AuthStepResponse::Form(result)).await;
                                 }
+
+                                let _ = tx.send(AuthStepResponse::Form(result)).await;
                             }
 
                             _ => (),
@@ -2049,4 +2079,13 @@ async fn delete_message(state: &Arc<RwLock<AppState>>, tx: &mpsc::Sender<ClientE
             }
         }
     }
+}
+
+fn clear() {
+    let stdout = std::io::stdout();
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.clear().unwrap();
+    crossterm::terminal::disable_raw_mode().unwrap();
+    terminal.set_cursor(0, 0).unwrap();
 }
