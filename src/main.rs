@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::UNIX_EPOCH,
+    time::UNIX_EPOCH, ops::Range,
 };
 
 use chrono::{DateTime, Local};
@@ -18,7 +18,7 @@ use harmony_rust_sdk::{
             content::{Content, TextContent},
             get_channel_messages_request::Direction,
             EventSource, FormattedText, GetGuildListRequest,
-            Message as RawMessage, SendMessageRequest, DeleteMessageRequest, UpdateMessageTextRequest, GetGuildRequest, GuildListEntry, GetGuildChannelsRequest, LeaveGuildRequest, JoinGuildRequest,
+            Message as RawMessage, SendMessageRequest, DeleteMessageRequest, UpdateMessageTextRequest, GetGuildRequest, GuildListEntry, GetGuildChannelsRequest, LeaveGuildRequest, JoinGuildRequest, format::{Format, color},
         },
         profile::{GetProfileRequest, Profile, self},
     },
@@ -109,10 +109,35 @@ impl Default for AppMode {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum FormatMetadata {
+    Bold,
+    Italic,
+    Underline,
+    Monospace, // lol
+    Superscript, // oh no
+    Subscript, // *oh no*
+    CodeBlock,
+    UserMention,
+    RoleMention,
+    ChannelMention,
+    GuildMention,
+    Emoji,
+    Color,
+    Localisation,
+    Compose(Vec<FormatMetadata>),
+}
+
+#[derive(Debug)]
+struct RichText {
+    contents: String,
+    formats: Vec<(Range<usize>, Style, FormatMetadata)>,
+}
+
 /// Represents the contents of a received message.
 enum MessageContent {
     /// A message composed of text.
-    Text(String),
+    Text(RichText),
 }
 
 /// Represents a received message.
@@ -386,7 +411,11 @@ async fn main() -> ClientResult<()> {
                                 guild.id,
                                 channel_id,
                                 Some(chat::Content::new(Some(Content::new_text_message(
-                                    TextContent::new(Some(FormattedText::new(msg, vec![]))),
+                                    TextContent::new(Some(FormattedText::new(String::from("abcdef"), vec![
+                                        harmony_rust_sdk::api::chat::Format { start: 0, length: 5, format: Some(Format::Bold(chat::format::Bold {})) },
+                                        harmony_rust_sdk::api::chat::Format { start: 1, length: 1, format: Some(Format::Underline(chat::format::Underline {})) },
+                                        harmony_rust_sdk::api::chat::Format { start: 3, length: 1, format: Some(Format::Underline(chat::format::Underline {})) },
+                                    ]))),
                                 )))),
                                 None,
                                 None,
@@ -697,7 +726,7 @@ async fn auth_tui(state: Arc<RwLock<AuthState>>) -> Result<(), std::io::Error> {
                     f.render_stateful_widget(list, vertical[0], &mut list_state);
                 }
 
-                AuthInput::Form { fields, selected, selected_second, editing }=> {
+                AuthInput::Form { fields, selected, selected_second, editing: _ }=> {
                     let layout_vec: Vec<_> = fields
                         .iter()
                         .map(|v| if let AuthFormFieldType::NewPassword = v.1 {
@@ -999,7 +1028,7 @@ fn handle_message(state: &mut AppState, message: RawMessage, guild_id: u64, chan
                                 id: message_id,
                                 author_id,
                                 override_username: message.overrides.and_then(|v| v.username),
-                                content: MessageContent::Text(text.text),
+                                content: MessageContent::Text(convert_formatted_text_to_rich_text(text)),
                                 timestamp: message.created_at,
                                 edited_timestamp: message.edited_at,
                             };
@@ -1031,6 +1060,125 @@ fn handle_message(state: &mut AppState, message: RawMessage, guild_id: u64, chan
     } else {
         None
     }
+}
+
+fn convert_formatted_text_to_rich_text(mut text: FormattedText) -> RichText {
+    let mut rich = RichText {
+        contents: text.text,
+        formats: vec![],
+    };
+
+    text.format.sort_by(|a, b| a.length.cmp(&b.length));
+    for format in text.format {
+        let (start, end) = (format.start as usize, (format.start + format.length) as usize);
+
+        if let Some(format) = format.format {
+            let (style, meta) = match format {
+                Format::Bold(_) => {
+                    (Style::default().add_modifier(Modifier::BOLD), FormatMetadata::Bold)
+                }
+
+                Format::Italic(_) => {
+                    (Style::default().add_modifier(Modifier::ITALIC), FormatMetadata::Italic)
+                }
+
+                Format::Underline(_) => {
+                    (Style::default().add_modifier(Modifier::UNDERLINED), FormatMetadata::Underline)
+                }
+
+                Format::Monospace(_) => {
+                    (Style::default().bg(Color::Gray), FormatMetadata::Monospace)
+                }
+
+                Format::Superscript(_) => {
+                    (Style::default(), FormatMetadata::Superscript)
+                }
+
+                Format::Subscript(_) => {
+                    (Style::default(), FormatMetadata::Subscript)
+                }
+
+                Format::CodeBlock(_) => todo!(),
+
+                Format::UserMention(_) => todo!(),
+
+                Format::RoleMention(_) => todo!(),
+
+                Format::ChannelMention(_) => todo!(),
+
+                Format::GuildMention(_) => todo!(),
+
+                Format::Emoji(_) => todo!(),
+
+                Format::Color(colour) => {
+                    match colour.kind() {
+                        color::Kind::DimUnspecified => todo!(),
+                        color::Kind::Bright => todo!(),
+                        color::Kind::Negative => todo!(),
+                        color::Kind::Positive => todo!(),
+                        color::Kind::Info => todo!(),
+                        color::Kind::Warning => todo!(),
+                    }
+                }
+
+                Format::Localization(_) => todo!(),
+            };
+
+            rich.formats.push((start..end, style, meta));
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut merged = vec![];
+        for (i, (span1, style1, meta1)) in rich.formats.iter().enumerate() {
+            let mut merged_bool = false;
+            for (span2, style2, meta2) in rich.formats.iter().skip(i + 1) {
+                if span1.contains(&span2.start) || span1.contains(&(span2.end - 1)) {
+                    changed = true;
+                    merged_bool = true;
+                    let span_merged = span1.start.max(span2.start)..span1.end.min(span2.end);
+
+                    let meta3 = if meta1 == meta2 {
+                        meta1.clone()
+                    } else {
+                        FormatMetadata::Compose(match (meta1.clone(), meta2.clone()) {
+                            (FormatMetadata::Compose(mut v1), FormatMetadata::Compose(v2)) => {
+                                v1.extend(v2);
+                                v1
+                            }
+
+                            (FormatMetadata::Compose(mut v), m) | (m, FormatMetadata::Compose(mut v)) => {
+                                v.push(m);
+                                v
+                            }
+
+                            (a, b) => vec![a, b],
+                        })
+                    };
+                    merged.push((span_merged, style1.patch(*style2), meta3));
+
+                    // TODO: aaaaaaaaaaaaaaaaaaaaaaa
+                    /*
+                    let (span1, span2) = {
+                        ()
+                    };
+                    */
+                }
+            }
+
+            if !merged_bool {
+                merged.push((span1.clone(), *style1, meta1.clone()));
+            }
+        }
+
+        rich.formats = merged;
+    }
+
+    rich.formats.sort_by(|a, b| a.0.start.cmp(&b.0.start));
+
+    rich
 }
 
 fn handle_user(state: &mut AppState, user_id: u64, user: Profile) {
@@ -1128,7 +1276,7 @@ async fn receive_events(
                                                     // TODO: more patterns
                                                     #[allow(irrefutable_let_patterns)]
                                                     if let MessageContent::Text(_) = message.content {
-                                                        message.content = MessageContent::Text(content.text);
+                                                        message.content = MessageContent::Text(convert_formatted_text_to_rich_text(content));
                                                         message.edited_timestamp = Some(edited_at);
                                                     }
                                                 }
@@ -1373,21 +1521,56 @@ async fn tui(state: Arc<RwLock<AppState>>) -> Result<(), std::io::Error> {
                             match &v.content {
                                 // Text wraps
                                 MessageContent::Text(text) => {
+                                    let mut lines = vec![];
                                     let mut i = 0;
-                                    while i < text.len() {
+                                    while i < text.contents.len() {
                                         let mut j = i;
                                         let mut k = 0;
-                                        while k < inner.width && j < text.bytes().len() {
+                                        while k < inner.width && j < text.contents.bytes().len() {
                                             j += 1;
-                                            if text.is_char_boundary(j) {
+                                            if text.contents.is_char_boundary(j) {
                                                 k += 1;
                                             }
                                         }
 
-                                        result.push(Spans::from(&text[i..j]));
+                                        lines.push(i..j);
                                         i = j;
                                     }
-                                    result.push(Spans::from(&text[i..]));
+                                    if i != text.contents.bytes().len() {
+                                        lines.push(i..text.contents.bytes().len());
+                                    }
+
+                                    let mut i = 0;
+                                    for line in lines {
+                                        let mut spans = vec![];
+
+                                        if let Some((span, ..)) = text.formats.get(i) {
+                                            if line.start <= span.start && span.start < line.end {
+                                                spans.push(Span::raw(&text.contents[line.start..span.start]));
+
+                                                for (span, style, _) in text.formats.iter().skip(i) {
+                                                    if span.start < line.end {
+                                                        spans.push(Span::styled(&text.contents[span.start..span.end.min(line.end)], *style));
+                                                    } else {
+                                                        spans.push(Span::raw(&text.contents[text.formats[i - 1].0.end..line.end]));
+                                                        break;
+                                                    }
+
+                                                    if line.end <= span.end {
+                                                        break;
+                                                    }
+
+                                                    i += 1;
+                                                }
+                                            } else {
+                                                spans.push(Span::raw(text.contents.as_str()));
+                                            }
+                                        } else {
+                                            spans.push(Span::raw(text.contents.as_str()));
+                                        }
+
+                                        result.push(Spans::from(spans));
+                                    }
                                 }
                             }
 
@@ -1848,7 +2031,7 @@ async fn ui_events(state: Arc<RwLock<AppState>>, tx: mpsc::Sender<ClientEvent>) 
                                         if message.author_id == current_user {
                                             #[allow(irrefutable_let_patterns)]
                                             if let MessageContent::Text(text) = &message.content {
-                                                text.clone()
+                                                text.contents.clone()
                                             } else {
                                                 continue;
                                             }
