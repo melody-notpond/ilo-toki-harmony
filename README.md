@@ -31,6 +31,8 @@ Channel selection mode is like guild selection mode but for channels instead of 
  - Mouse support
  - `:tutorial` command for new users
  - PluralKit-like functionality
+ - ilo toki daemon
+ - Notifications
 
 Things that aren't important but would be neat:
  - Pictures in terminal for terminals that support it
